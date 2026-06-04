@@ -501,7 +501,7 @@ def create_authenticated_client(username: str, password: str, **kwargs) -> httpx
         已认证的 httpx.Client
 
     Example:
-        client = create_authenticated_client("REMOVED_USERNAME", "REMOVED_PASSWORD")
+        client = create_authenticated_client("username", "password")
         resp = client.get("http://202.117.17.144/product/findtime.html?...")
     """
     cas = CASLogin(**kwargs)
@@ -513,8 +513,12 @@ def create_authenticated_client(username: str, password: str, **kwargs) -> httpx
 if __name__ == "__main__":
     import sys
 
-    username = sys.argv[1] if len(sys.argv) > 1 else "REMOVED_USERNAME"
-    password = sys.argv[2] if len(sys.argv) > 2 else "REMOVED_PASSWORD"
+    if len(sys.argv) < 3:
+        print("Usage: python cas_login.py <username> <password>")
+        sys.exit(1)
+
+    username = sys.argv[1]
+    password = sys.argv[2]
 
     print("=" * 60)
     print("西安交通大学 CAS 统一认证 - HTTP 登录测试")

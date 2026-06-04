@@ -27,7 +27,7 @@ from models import ProfileCreate, ProfileUpdate, ProfileSummary, ProfileResponse
 
 # ==================== Auth ====================
 
-ADMIN_USERNAME = "admin"
+ADMIN_USERNAME = os.getenv("BOOKING_ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("BOOKING_ADMIN_PASSWORD")
 
 # In-memory session store: {token: {"username": str, "is_admin": bool}}
@@ -161,7 +161,7 @@ async def index():
 @app.post("/api/login")
 async def login(body: LoginRequest):
     # Admin login
-    if body.username == ADMIN_USERNAME and body.password == ADMIN_PASSWORD:
+    if ADMIN_PASSWORD and body.username == ADMIN_USERNAME and body.password == ADMIN_PASSWORD:
         token = secrets.token_hex(32)
         _sessions[token] = {"username": ADMIN_USERNAME, "is_admin": True}
         return {"token": token, "username": ADMIN_USERNAME, "is_admin": True}
