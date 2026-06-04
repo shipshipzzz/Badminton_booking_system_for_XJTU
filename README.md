@@ -50,6 +50,3 @@ Install via `web_platform/requirements.txt`:
 - opencv-python
 - numpy
 
-## Sensitive Data
-
-`web_platform/bookings.db` still stores local account/task data, including saved profile credentials. Do not share it unless you intentionally want to share those records.
