@@ -1,0 +1,1280 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>羽毛球场地预订管理</title>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background:#f0f2f5; color:#333; height:100vh; display:flex; flex-direction:column; }
+.header { background:linear-gradient(135deg,#1e88e5,#1565c0); color:#fff; padding:14px 24px; font-size:20px; font-weight:700; display:flex; align-items:center; gap:12px; }
+.header span { font-size:14px; font-weight:400; opacity:.8; }
+.layout { display:flex; flex:1; overflow:hidden; }
+.sidebar { width:220px; background:#fff; border-right:1px solid #e0e0e0; display:flex; flex-direction:column; }
+.sidebar-item { padding:12px 18px; cursor:pointer; border-bottom:1px solid #f0f0f0; font-size:14px; display:flex; align-items:center; gap:8px; }
+.sidebar-item:hover { background:#e3f2fd; }
+.sidebar-item.active { background:#1e88e5; color:#fff; }
+.sidebar-item .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+.sidebar-group-title { padding:10px 18px 6px; font-size:11px; color:#78909c; font-weight:700; text-transform:uppercase; letter-spacing:.4px; }
+.sidebar-group .sidebar-item { padding-left:24px; }
+.main { flex:1; overflow-y:auto; padding:20px; }
+.btn { border:none; border-radius:6px; padding:8px 16px; cursor:pointer; font-size:13px; font-weight:600; color:#fff; }
+.btn:disabled { opacity:.5; cursor:not-allowed; }
+.btn-blue { background:#1e88e5; } .btn-blue:hover:not(:disabled) { background:#1565c0; }
+.btn-green { background:#4caf50; } .btn-green:hover:not(:disabled) { background:#388e3c; }
+.btn-red { background:#f44336; } .btn-red:hover:not(:disabled) { background:#d32f2f; }
+.btn-purple { background:#7c4dff; } .btn-purple:hover:not(:disabled) { background:#651fff; }
+.btn-gray { background:#9e9e9e; } .btn-gray:hover:not(:disabled) { background:#757575; }
+.btn-cyan { background:#00acc1; } .btn-cyan:hover:not(:disabled) { background:#00838f; }
+.btn-sm { padding:5px 10px; font-size:12px; }
+.card { background:#fff; border-radius:10px; padding:16px; margin-bottom:16px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+.card-title { font-size:15px; font-weight:700; margin-bottom:12px; color:#1565c0; }
+.tabs { display:flex; gap:6px; margin-bottom:16px; }
+.tab-btn { border:1px solid #d0d7de; background:#fff; border-radius:8px; padding:8px 16px; cursor:pointer; font-size:13px; font-weight:600; }
+.tab-btn.active { background:#1e88e5; border-color:#1e88e5; color:#fff; }
+.form-row { display:flex; align-items:center; gap:10px; margin:8px 0; flex-wrap:wrap; }
+.form-label { font-size:13px; color:#555; min-width:80px; }
+input[type=text], input[type=password], input[type=number], input[type=time], select {
+  border:1px solid #d0d7de; border-radius:6px; padding:6px 10px; font-size:13px; outline:none;
+}
+input:focus, select:focus { border-color:#1e88e5; }
+.chip { display:inline-block; border:1px solid #d0d7de; border-radius:8px; padding:4px 12px; font-size:12px; cursor:pointer; margin:2px; position:relative; user-select:none; }
+.chip.on { background:#1e88e5; border-color:#1e88e5; color:#fff; }
+.chip .pri { position:absolute; top:-7px; right:-7px; background:#ffc107; color:#111; border-radius:10px; padding:1px 5px; font-size:10px; font-weight:800; }
+.chip.on .pri { background:rgba(255,255,255,.9); }
+.time-row { display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid #f5f5f5; }
+.time-row label { font-size:12px; }
+.log-console { background:#1a1a2e; color:#0f0; font-family:'Consolas',monospace; font-size:11px; padding:10px; border-radius:8px; height:220px; overflow-y:auto; overflow-x:auto; white-space:pre-wrap; word-break:break-all; }
+.log-line { margin:1px 0; }
+.status-badge { display:inline-block; padding:3px 10px; border-radius:12px; font-size:11px; font-weight:700; color:#fff; }
+.status-idle { background:#9e9e9e; }
+.status-waiting { background:#2196f3; }
+.status-running { background:#ff9800; animation:pulse 1.2s infinite; }
+.status-success { background:#4caf50; }
+.status-failed { background:#f44336; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.6} }
+.dash-card { border:1px solid #e0e0e0; border-radius:10px; padding:14px; display:flex; align-items:center; gap:14px; cursor:pointer; }
+.dash-card:hover { border-color:#1e88e5; box-shadow:0 2px 8px rgba(30,136,229,.15); }
+.dash-card .info { flex:1; }
+.dash-card .info h3 { font-size:14px; margin-bottom:4px; }
+.dash-card .info .user { font-size:12px; color:#888; }
+.dash-card .last-log { font-size:11px; color:#666; margin-top:4px; max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dashboard-group { margin-bottom:20px; }
+.dashboard-group-title { font-size:13px; font-weight:700; color:#607d8b; margin:0 0 10px 2px; }
+.group-toggle { display:flex; align-items:center; justify-content:space-between; gap:8px; cursor:pointer; user-select:none; }
+.group-toggle-main { display:flex; align-items:center; gap:6px; min-width:0; }
+.group-toggle .chevron { display:inline-block; font-size:11px; color:#90a4ae; transition:transform .15s ease; }
+.group-toggle.collapsed .chevron { transform:rotate(-90deg); }
+.group-count { font-size:11px; color:#90a4ae; font-weight:600; flex-shrink:0; }
+.log-layout { display:flex; gap:12px; align-items:stretch; }
+.log-main { flex:1; min-width:0; }
+.log-console { height:100%; min-height:220px; }
+.latest-booking-side { width:280px; flex-shrink:0; border:1px solid #ffe082; border-radius:8px; background:#fff8e1; padding:10px; display:flex; flex-direction:column; }
+.latest-booking-side.unread { background:#fff3e0; border-color:#ffb74d; }
+.latest-booking-side .title { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; color:#ef6c00; font-size:12px; font-weight:700; }
+.latest-booking-side .text { font-size:12px; color:#5d4037; white-space:pre-line; line-height:1.6; word-break:break-word; }
+.latest-booking-side .empty { font-size:12px; color:#999; }
+.booking-result-dot { width:8px; height:8px; border-radius:50%; background:#f44336; display:inline-block; }
+@media (max-width: 960px) {
+  .log-layout { flex-direction:column; }
+  .latest-booking-side { width:auto; }
+}
+.venue-block { border:1px solid #e9ecef; border-radius:8px; padding:10px; margin:8px 0; background:#fafafa; }
+.venue-name { font-weight:700; font-size:13px; margin-bottom:6px; }
+.add-btn { border:2px dashed #ccc; border-radius:10px; padding:12px; text-align:center; cursor:pointer; color:#999; font-size:14px; }
+.add-btn:hover { border-color:#1e88e5; color:#1e88e5; }
+/* Court query table */
+.court-table { width:100%; border-collapse:collapse; font-size:12px; margin-top:10px; }
+.court-table th, .court-table td { border:1px solid #ddd; text-align:center; padding:4px 6px; }
+.court-table th { background:#f0f0f0; font-weight:600; color:#555; }
+.court-table .cell-ok { background:#4cd964; color:#fff; font-weight:600; cursor:pointer; }
+.court-table .cell-ok:hover { background:#3cb852; transform:scale(1.02); }
+.court-table .cell-no { background:#f90; color:rgba(0,0,0,.4); }
+.court-table .cell-booking { background:#ffcc00; color:#333; font-weight:600; animation:pulse 1s infinite; }
+.court-table .time-cell { background:#f8f8f8; color:#555; font-size:11px; }
+.status-text { font-size:12px; font-weight:600; }
+.status-text.idle { color:#9e9e9e; }
+.status-text.waiting { color:#2196f3; }
+.status-text.running { color:#ff9800; }
+.status-text.success { color:#4caf50; }
+.status-text.failed { color:#f44336; }
+.login-page { display:flex; justify-content:center; align-items:center; height:100vh; background:linear-gradient(135deg,#1e88e5,#1565c0); }
+.login-box { background:#fff; border-radius:16px; padding:40px; width:360px; box-shadow:0 8px 40px rgba(0,0,0,.2); }
+.login-box h2 { text-align:center; margin-bottom:24px; color:#1565c0; }
+.login-box input { width:100%; margin-bottom:14px; padding:10px 14px; border:1px solid #d0d7de; border-radius:8px; font-size:14px; outline:none; }
+.login-box input:focus { border-color:#1e88e5; }
+.login-box .login-btn { width:100%; padding:12px; background:#1e88e5; color:#fff; border:none; border-radius:8px; font-size:15px; font-weight:700; cursor:pointer; }
+.login-box .login-btn:hover { background:#1565c0; }
+.login-box .login-btn:disabled { opacity:.5; cursor:not-allowed; }
+.login-box .login-error { color:#f44336; font-size:13px; text-align:center; margin-top:10px; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Login / Register Page -->
+  <div v-if="!authToken" class="login-page">
+    <div class="login-box" v-if="!showRegister">
+      <h2>&#127992; 羽毛球预订管理</h2>
+      <input type="text" v-model="loginUsername" placeholder="用户名" @keyup.enter="doLogin">
+      <input type="password" v-model="loginPassword" placeholder="密码" @keyup.enter="doLogin">
+      <button class="login-btn" @click="doLogin" :disabled="loggingIn">
+        {{ loggingIn ? '登录中...' : '登录' }}
+      </button>
+      <div class="login-error" v-if="loginError">{{ loginError }}</div>
+      <div style="text-align:center;margin-top:14px">
+        <a href="#" @click.prevent="showRegister=true" style="color:#1e88e5;font-size:13px">没有账号？使用邀请码注册</a>
+      </div>
+    </div>
+    <div class="login-box" v-else>
+      <h2>&#127992; 注册账户</h2>
+      <input type="text" v-model="regUsername" placeholder="CAS 学号/工号" @keyup.enter="doRegister">
+      <input type="password" v-model="regPassword" placeholder="CAS 密码" @keyup.enter="doRegister">
+      <input type="text" v-model="regInviteCode" placeholder="邀请码" @keyup.enter="doRegister">
+      <button class="login-btn" @click="doRegister" :disabled="registering">
+        {{ registering ? '验证中（CAS登录验证）...' : '注册' }}
+      </button>
+      <div class="login-error" v-if="regError">{{ regError }}</div>
+      <div v-if="regSuccess" style="color:#4caf50;font-size:13px;text-align:center;margin-top:10px">{{ regSuccess }}</div>
+      <div style="text-align:center;margin-top:14px">
+        <a href="#" @click.prevent="showRegister=false" style="color:#1e88e5;font-size:13px">返回登录</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main App (after login) -->
+  <template v-else>
+  <div class="header">
+    <span style="font-size:22px">&#127992;</span> 羽毛球场地预订管理
+    <span>{{ authUser }} <template v-if="isAdmin">(管理员)</template></span>
+    <div style="flex:1"></div>
+    <button class="btn btn-sm" style="background:rgba(255,255,255,.2);color:#fff" @click="doLogout">退出</button>
+  </div>
+  <div class="layout">
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <div class="sidebar-item" :class="{active: view==='dashboard'}" @click="view='dashboard'; currentId=null">
+        <span style="font-size:16px">&#9783;</span> 控制面板
+      </div>
+      <div v-for="group in groupedProfiles" :key="`sidebar-${group.key || 'ungrouped'}`" class="sidebar-group">
+        <div v-if="showGroupLabels"
+             class="sidebar-group-title group-toggle"
+             :class="{collapsed: isGroupCollapsed('sidebar', group.key)}"
+             @click="toggleGroupCollapsed('sidebar', group.key)">
+          <span class="group-toggle-main">
+            <span class="chevron">&#9662;</span>
+            <span>{{ group.label }}</span>
+          </span>
+          <span class="group-count">{{ group.profiles.length }}</span>
+        </div>
+        <div v-show="!showGroupLabels || !isGroupCollapsed('sidebar', group.key)">
+          <div v-for="p in group.profiles" :key="p.id"
+               class="sidebar-item" :class="{active: currentId===p.id}"
+               @click="selectProfile(p.id)">
+            <span class="dot" :style="{background: statusColor(p.status)}"></span>
+            {{ p.name }}
+          </div>
+        </div>
+      </div>
+      <div v-if="isAdmin" class="add-btn" style="margin:10px" @click="addProfile">+ 添加账户</div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main">
+
+      <!-- Dashboard View -->
+      <div v-if="view==='dashboard'">
+        <h2 style="margin-bottom:16px">控制面板</h2>
+        <div v-if="!profiles.length" style="color:#999;text-align:center;padding:40px">
+          暂无账户，点击左侧"+ 添加账户"开始
+        </div>
+        <div v-for="group in groupedProfiles" :key="`dash-${group.key || 'ungrouped'}`" class="dashboard-group">
+          <div v-if="showGroupLabels"
+               class="dashboard-group-title group-toggle"
+               :class="{collapsed: isGroupCollapsed('dashboard', group.key)}"
+               @click="toggleGroupCollapsed('dashboard', group.key)">
+            <span class="group-toggle-main">
+              <span class="chevron">&#9662;</span>
+              <span>{{ group.label }}</span>
+            </span>
+            <span class="group-count">{{ group.profiles.length }}</span>
+          </div>
+          <div v-show="!showGroupLabels || !isGroupCollapsed('dashboard', group.key)"
+               style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px">
+            <div v-for="p in group.profiles" :key="p.id" class="dash-card" @click="selectProfile(p.id)">
+            <div class="info">
+              <h3>{{ p.name }}</h3>
+              <div class="user">{{ p.username || '(未配置账号)' }}</div>
+              <div class="last-log" v-if="lastLogs[p.id]">{{ lastLogs[p.id] }}</div>
+            </div>
+            <span class="status-badge" :class="'status-'+p.status">{{ statusLabel(p.status) }}</span>
+          </div>
+        </div>
+        </div>
+
+        <!-- Admin: Invite Code Management -->
+        <div v-if="isAdmin" class="card" style="margin-top:20px">
+          <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+            邀请码管理
+            <button class="btn btn-blue btn-sm" @click="generateInviteCode">生成邀请码</button>
+          </div>
+          <div v-if="!inviteCodes.length" style="color:#999;font-size:12px">暂无邀请码</div>
+          <table v-else class="court-table" style="font-size:12px">
+            <thead>
+              <tr><th>邀请码</th><th>创建时间</th><th>状态</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="ic in inviteCodes" :key="ic.code">
+                <td style="font-family:monospace;font-weight:700;letter-spacing:1px">{{ ic.code }}</td>
+                <td style="font-size:11px;color:#666">{{ ic.created_at }}</td>
+                <td>
+                  <span v-if="ic.used_by" style="color:#999">已使用 ({{ ic.used_by }})</span>
+                  <span v-else style="color:#4caf50;font-weight:700">可用</span>
+                </td>
+                <td><button class="btn btn-red btn-sm" @click="deleteInviteCode(ic.code)">删除</button></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+      </div>
+
+      <!-- Profile Editor View -->
+      <div v-if="view==='profile' && current">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+          <input v-model="current.name" @change="saveProfile" style="font-size:18px;font-weight:700;border:none;border-bottom:2px solid #1e88e5;padding:4px 0;outline:none;background:transparent" />
+          <input v-model="current.group_name" @change="saveProfile" placeholder="Group name" style="width:150px;border:1px solid #d0d7de;border-radius:6px;padding:6px 10px;font-size:12px" />
+          <span class="status-badge" :class="'status-'+currentStatus">{{ statusLabel(currentStatus) }}</span>
+          <div style="flex:1"></div>
+          <button class="btn btn-blue btn-sm" @click="cloneProfile" :disabled="cloning">
+            {{ cloning ? '复制中...' : '复制配置' }}
+          </button>
+          <button v-if="isAdmin" class="btn btn-red btn-sm" @click="deleteProfile">删除</button>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tabs">
+          <div class="tab-btn" :class="{active:tab==='booking'}" @click="tab='booking'">抢票</div>
+          <div class="tab-btn" :class="{active:tab==='prefs'}" @click="tab='prefs'">偏好设置</div>
+          <div class="tab-btn" :class="{active:tab==='account'}" @click="tab='account'">账号</div>
+        </div>
+
+        <!-- Booking Tab -->
+        <div v-show="tab==='booking'">
+          <!-- Target Days -->
+          <div class="card">
+            <div class="card-title">目标日期</div>
+            <div class="form-row">
+              <div v-for="d in [0,1,2,3]" :key="d"
+                   class="chip" :class="{on: current.target_days.includes(d)}"
+                   @click="toggleDay(d)">
+                {{ dayLabel(d) }}
+              </div>
+            </div>
+          </div>
+
+          <!-- Scheduled Booking -->
+          <div class="card">
+            <div class="card-title">定时抢票</div>
+            <div class="form-row">
+              <label><input type="checkbox" v-model="current.schedule_enabled" @change="saveProfile"> 启用</label>
+              <input type="time" step="1" v-model="current.schedule_time" @change="saveProfile" style="width:120px">
+              <select v-model="current.schedule_mode" @change="saveProfile">
+                <option value="api">纯API模式</option>
+                <option value="mix">混合模式</option>
+              </select>
+              <span class="form-label">提前查询(ms):</span>
+              <input type="number" v-model.number="current.pre_query_delay" @change="saveProfile" min="0" max="5000" step="100" style="width:80px">
+            </div>
+            <div class="form-row">
+              <span class="form-label">生效星期:</span>
+              <div v-for="d in [0,1,2,3,4,5,6]" :key="`w-${d}`"
+                   class="chip" :class="{on: current.schedule_weekdays.includes(d)}"
+                   @click="toggleScheduleWeekday(d)">
+                {{ weekdayLabel(d) }}
+              </div>
+            </div>
+            <div class="form-row">
+              <span class="form-label">最大预订数:</span>
+              <input type="number" v-model.number="current.max_bookings" @change="saveProfile" min="1" max="5" style="width:60px">
+            </div>
+            <div style="font-size:12px;color:#666;margin-top:4px">
+              开启后会自动排到下一个勾选的星期，无需每天手动点启用。
+            </div>
+            <div v-if="current.next_schedule_at" style="margin-top:8px;font-size:12px;color:#666">
+              下次执行: {{ current.next_schedule_at }}
+            </div>
+            <div class="form-row" style="gap:8px;margin-top:10px">
+              <button class="btn btn-green" @click="startScheduled" :disabled="currentStatus==='running' || currentStatus==='waiting'">定时启动</button>
+              <button class="btn btn-purple" @click="startImmediate" :disabled="currentStatus==='running' || currentStatus==='waiting'">立即抢票</button>
+              <button class="btn btn-red" @click="stopBooking" :disabled="currentStatus==='idle'">停止</button>
+              <button class="btn btn-cyan" @click="queryCourtStatus" :disabled="querying">{{ querying ? '查询中...' : '查询场地' }}</button>
+            </div>
+            <div v-if="countdown" style="margin-top:8px;font-size:13px;color:#1565c0;font-weight:600">{{ countdown }}</div>
+          </div>
+
+          <!-- Court Query Result -->
+          <div class="card" v-if="courtData && courtData.length">
+            <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+              场地状态 <span style="font-size:11px;color:#888;font-weight:400">{{ queryDate }} | 点击绿色格子直接预订</span>
+            </div>
+            <div v-for="(venue, vi) in courtData" :key="vi" style="margin-bottom:12px">
+              <div style="font-weight:700;font-size:13px;color:#1565c0;margin-bottom:4px;padding:4px 8px;background:#e3f2fd;border-radius:4px">{{ venue.name }}</div>
+              <table class="court-table">
+                <thead>
+                  <tr>
+                    <th style="width:90px">时段</th>
+                    <th v-for="c in venue.totalCourts" :key="c">场地{{c}}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="slot in venue.slots" :key="slot.time">
+                    <td class="time-cell">{{ slot.time }}</td>
+                    <td v-for="seat in slot.seats" :key="seat.court"
+                        :class="seat.available ? (seat.booking ? 'cell-booking' : 'cell-ok') : 'cell-no'"
+                        :style="seat.available && !seat.booking ? {cursor:'pointer'} : {}"
+                        @click="bookCourt(venue, slot, seat)">
+                      {{ seat.booking ? '预订中' : (seat.available ? '¥0' : '无') }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- My Orders -->
+          <div class="card">
+            <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+              我的订单
+              <button class="btn btn-blue btn-sm" @click="loadOrders" :disabled="loadingOrders">
+                {{ loadingOrders ? '加载中...' : '刷新订单' }}
+              </button>
+            </div>
+            <div v-if="ordersError" style="color:#f44336;font-size:12px;margin-bottom:8px">{{ ordersError }}</div>
+            <div v-if="orders === null" style="color:#999;font-size:12px">点击"刷新订单"查看当前账号的预订记录</div>
+            <table v-else-if="orders.length" class="court-table" style="font-size:12px">
+              <thead>
+                <tr>
+                  <th>场馆</th>
+                  <th>日期</th>
+                  <th>时段</th>
+                  <th>场地</th>
+                  <th>下单时间</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="o in orders" :key="o.orderId">
+                  <td>{{ o.venue }}</td>
+                  <td>{{ o.date }}</td>
+                  <td style="font-weight:600">{{ o.timeSlot }}</td>
+                  <td style="font-weight:600">{{ o.court }}</td>
+                  <td style="font-size:11px;color:#666">{{ o.createTime }}</td>
+                  <td :style="{color: o.status==='完成' ? '#4caf50' : o.status==='已取消' ? '#999' : '#ff9800', fontWeight:700}">
+                    {{ o.status }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-else style="color:#999;font-size:12px">暂无订单</div>
+          </div>
+
+          <!-- Log Console -->
+          <div class="card">
+            <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+              <div style="display:flex;align-items:center;gap:8px">
+                日志
+                <select v-model="selectedLogDate" @change="loadHistoryLog" style="font-size:12px;padding:2px 6px;font-weight:400">
+                  <option value="">实时日志</option>
+                  <option v-for="lf in logFiles" :key="lf.session" :value="lf.session">
+                    {{ lf.display }} ({{ lf.lines }}条)
+                  </option>
+                </select>
+              </div>
+              <div style="display:flex;gap:4px">
+                <button class="btn btn-gray btn-sm" @click="refreshLogFiles">刷新</button>
+                <button class="btn btn-gray btn-sm" @click="clearLogs">清空</button>
+              </div>
+            </div>
+            <div class="log-layout">
+              <div class="log-main">
+                <div class="log-console" ref="logConsole">
+                  <div v-for="(l,i) in displayLogs" :key="i" class="log-line">{{ l }}</div>
+                </div>
+              </div>
+              <div class="latest-booking-side" :class="{unread: current.latest_booking_result_unread}">
+                <div class="title">
+                  <div style="display:flex;align-items:center;gap:6px">
+                    <span v-if="current.latest_booking_result_unread" class="booking-result-dot"></span>
+                    <span>最近三天预约状态</span>
+                  </div>
+                  <button class="btn btn-gray btn-sm" @click="markLatestBookingRead" :disabled="!current.latest_booking_result_unread">已读</button>
+                </div>
+                <div v-if="current.latest_booking_result" class="text">{{ current.latest_booking_result }}</div>
+                <div v-else class="empty">暂无记录</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Preferences Tab -->
+        <div v-show="tab==='prefs'">
+          <!-- Venue Preferences -->
+          <div class="card">
+            <div class="card-title">场馆偏好</div>
+            <div style="font-size:11px;color:#999;margin-bottom:8px">点击场地选择/取消；按住 Alt/Ctrl/Shift 点击可设置优先级(1-6，数字越小越优先)</div>
+            <div class="venue-block" v-for="(v,vi) in current.venue_prefs" :key="v.id">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                <label><input type="checkbox" v-model="v.enabled" @change="saveProfile"></label>
+                <span class="venue-name">{{ v.name }}</span>
+              </div>
+              <div>
+                <div class="chip" v-for="c in allCourts(v.id)" :key="c"
+                     :class="{on: v.courts.includes(c)}"
+                     @click="toggleCourt(vi, c)"
+                     @click.alt="cyclePriority(vi, c)"
+                     @click.ctrl="cyclePriority(vi, c)"
+                     @click.shift="cyclePriority(vi, c)">
+                  {{ c }}
+                  <span class="pri" v-if="v.courtPriority && v.courtPriority[String(c)]">{{ v.courtPriority[String(c)] }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Time Preferences -->
+          <div class="card">
+            <div class="card-title">时段偏好</div>
+            <div style="font-size:11px;color:#999;margin-bottom:8px">勾选要抢的时段。尝试数=最多试几个候选场地；场并=同一时段同时抢几个场地；优先级越小越靠前。</div>
+            <div style="font-size:11px;color:#999;margin-bottom:8px">场并=同一时段同时抢几个场地；失败后会按场地优先级继续递补。</div>
+            <div style="font-size:11px;color:#ef6c00;margin-bottom:8px">夏季时段会自动按同一小时匹配，例如 19:01-20:00 会匹配 19:31-20:30。</div>
+            <div class="time-row" v-for="(t,ti) in current.time_prefs" :key="t.time">
+              <label style="width:40px"><input type="checkbox" v-model="t.enabled" @change="saveProfile"></label>
+              <span style="width:100px;font-size:12px;font-weight:600">{{ t.time }}</span>
+              <span style="font-size:11px;color:#888">尝试:</span>
+              <input type="number" v-model.number="t.fanout" @change="saveProfile" min="0" max="10" style="width:50px">
+              <span style="font-size:11px;color:#888">场并:</span>
+              <input type="number" v-model.number="t.parallel" @change="saveProfile" min="1" max="10" style="width:50px">
+              <span style="font-size:11px;color:#888">优先级:</span>
+              <input type="number" v-model.number="t.priority" @change="saveProfile" min="1" max="5" style="width:50px">
+            </div>
+          </div>
+        </div>
+
+        <!-- Account Tab -->
+        <div v-show="tab==='account'">
+          <div class="card">
+            <div class="form-row">
+              <span class="form-label">分组:</span>
+              <input type="text" v-model="current.group_name" @change="saveProfile" placeholder="例如：杨晓" style="width:200px">
+            </div>
+            <div class="card-title">CAS 账号</div>
+            <div class="form-row">
+              <span class="form-label">用户名:</span>
+              <input v-if="isAdmin" type="text" v-model="current.username" @change="saveProfile" placeholder="学号/工号/手机号" style="width:200px">
+              <span v-else style="font-size:14px">{{ current.username }}</span>
+            </div>
+            <div class="form-row">
+              <span class="form-label">密码:</span>
+              <input v-if="isAdmin" type="text" v-model="current.password" @change="saveProfile" placeholder="CAS 密码" style="width:200px">
+              <span v-else style="font-size:14px">********</span>
+            </div>
+            <div class="form-row" style="margin-top:12px">
+              <button class="btn btn-blue" @click="testLogin" :disabled="loginTesting">
+                {{ loginTesting ? '测试中...' : '测试登录' }}
+              </button>
+              <span v-if="loginResult !== null" :style="{color: loginResult ? '#4caf50' : '#f44336', fontWeight:700, fontSize:'13px'}">
+                {{ loginResult ? '登录成功' : '登录失败' }}
+              </span>
+            </div>
+            <div style="font-size:11px;color:#f44336;margin-top:10px">
+              提示：密码以明文存储在本地数据库（与油猴脚本相同），请勿在公共设备上使用。
+            </div>
+          </div>
+
+
+          <!-- Change Password (for regular users) -->
+          <div v-if="!isAdmin" class="card">
+            <div class="card-title">修改密码</div>
+            <div style="font-size:12px;color:#666;margin-bottom:10px">
+              如果你在学校统一身份认证修改了密码，请在此同步更新，否则自动抢票将无法登录。
+            </div>
+            <div class="form-row">
+              <span class="form-label">新密码:</span>
+              <input type="password" v-model="newPassword" placeholder="输入新的 CAS 密码" style="width:200px">
+            </div>
+            <div class="form-row" style="margin-top:8px">
+              <button class="btn btn-blue" @click="changePassword" :disabled="changingPassword">
+                {{ changingPassword ? '验证中...' : '更新密码' }}
+              </button>
+              <span v-if="changePwResult" :style="{color: changePwResult.ok ? '#4caf50' : '#f44336', fontWeight:700, fontSize:'13px'}">
+                {{ changePwResult.msg }}
+              </span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+  </template>
+</div>
+
+<script>
+const { createApp, ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } = Vue
+
+createApp({
+  setup() {
+    // Auth state
+    const authToken = ref(localStorage.getItem('auth_token') || '')
+    const authUser = ref(localStorage.getItem('auth_user') || '')
+    const isAdmin = ref(localStorage.getItem('auth_admin') === 'true')
+    const loginUsername = ref('')
+    const loginPassword = ref('')
+    const loginError = ref('')
+    const loggingIn = ref(false)
+
+    // Registration
+    const showRegister = ref(false)
+    const regUsername = ref('')
+    const regPassword = ref('')
+    const regInviteCode = ref('')
+    const regError = ref('')
+    const regSuccess = ref('')
+    const registering = ref(false)
+
+    // Invite codes (admin)
+    const inviteCodes = ref([])
+
+    const profiles = ref([])
+    const view = ref('dashboard')
+    const currentId = ref(null)
+    const current = ref(null)
+    const tab = ref('booking')
+    const logs = ref([])
+    const lastLogs = reactive({})
+    const loginTesting = ref(false)
+    const loginResult = ref(null)
+    const cloning = ref(false)
+    const countdown = ref('')
+    const logConsole = ref(null)
+    const querying = ref(false)
+    const courtData = ref(null)
+    const queryDate = ref('')
+    const logFiles = ref([])
+    const selectedLogDate = ref('')
+    const historyLogContent = ref('')
+    const orders = ref(null)
+    const loadingOrders = ref(false)
+    const ordersError = ref('')
+    const newPassword = ref('')
+    const changingPassword = ref(false)
+    const changePwResult = ref(null)
+    let ws = null
+    let wsStatus = null
+    let countdownTimer = null
+
+    const VENUES = [
+      { id: 101, name: '一号巨构', totalCourts: 3 },
+      { id: 103, name: '二号巨构', totalCourts: 6 },
+      { id: 104, name: '三号巨构', totalCourts: 3 }
+    ]
+
+    const STATUS_LABELS = { idle:'空闲', waiting:'等待中', running:'运行中', success:'成功', failed:'失败' }
+
+    const currentStatus = computed(() => {
+      if (!current.value) return 'idle'
+      const p = profiles.value.find(x => x.id === currentId.value)
+      return p ? p.status : current.value.status
+    })
+    function normalizeGroupName(value) {
+      return String(value || '').trim()
+    }
+    function groupDisplayName(value) {
+      return value || '未分组'
+    }
+    const GROUP_COLLAPSE_STORAGE_KEY = 'profile_group_collapsed_v1'
+    const groupedProfiles = computed(() => {
+      const groups = []
+      const groupMap = new Map()
+      for (const profile of profiles.value) {
+        const key = normalizeGroupName(profile.group_name)
+        if (!groupMap.has(key)) {
+          const group = { key, label: groupDisplayName(key), profiles: [] }
+          groupMap.set(key, group)
+          groups.push(group)
+        }
+        groupMap.get(key).profiles.push(profile)
+      }
+      return groups
+    })
+    const showGroupLabels = computed(() =>
+      groupedProfiles.value.length > 1 ||
+      (groupedProfiles.value.length === 1 && groupedProfiles.value[0].key !== '')
+    )
+    const collapsedGroups = reactive({})
+    function loadCollapsedGroups() {
+      for (const key of Object.keys(collapsedGroups)) delete collapsedGroups[key]
+      try {
+        const raw = localStorage.getItem(GROUP_COLLAPSE_STORAGE_KEY)
+        if (!raw) return
+        const parsed = JSON.parse(raw)
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return
+        for (const [key, value] of Object.entries(parsed)) {
+          collapsedGroups[key] = !!value
+        }
+      } catch {}
+    }
+    function saveCollapsedGroups() {
+      try {
+        localStorage.setItem(GROUP_COLLAPSE_STORAGE_KEY, JSON.stringify({ ...collapsedGroups }))
+      } catch {}
+    }
+    function groupCollapseKey(scope, groupKey) {
+      return `${scope}:${groupKey || '__ungrouped__'}`
+    }
+    function isGroupCollapsed(scope, groupKey) {
+      return !!collapsedGroups[groupCollapseKey(scope, groupKey)]
+    }
+    function toggleGroupCollapsed(scope, groupKey) {
+      const key = groupCollapseKey(scope, groupKey)
+      collapsedGroups[key] = !collapsedGroups[key]
+    }
+    watch(collapsedGroups, saveCollapsedGroups, { deep: true })
+
+    function statusColor(s) {
+      return { idle:'#9e9e9e', waiting:'#2196f3', running:'#ff9800', success:'#4caf50', failed:'#f44336' }[s] || '#9e9e9e'
+    }
+    function statusLabel(s) { return STATUS_LABELS[s] || s }
+    function dayLabel(d) {
+      return { 0:'今天', 1:'明天', 2:'后天', 3:'大后天' }[d] || `${d}天后`
+    }
+    function allCourts(venueId) {
+      const v = VENUES.find(x => x.id === venueId)
+      return v ? Array.from({length: v.totalCourts}, (_,i) => i+1) : []
+    }
+    const DEFAULT_SCHEDULE_WEEKDAYS = [0,1,2,3,4,5,6]
+    const WEEKDAY_LABELS = ['周一','周二','周三','周四','周五','周六','周日']
+    function weekdayLabel(d) { return WEEKDAY_LABELS[d] || `D${d}` }
+    function normalizeProfileData(profile) {
+      if (!profile) return profile
+      const normalized = { ...profile }
+      normalized.group_name = normalizeGroupName(normalized.group_name)
+      if (typeof normalized.latest_booking_result !== 'string') normalized.latest_booking_result = ''
+      normalized.latest_booking_result_unread = !!normalized.latest_booking_result_unread
+      if (!normalized.latest_booking_result_at) normalized.latest_booking_result_at = null
+      if (!Array.isArray(normalized.target_days)) normalized.target_days = [2]
+      if (Array.isArray(normalized.time_prefs)) {
+        const toInt = (value, fallback) => {
+          const n = Number(value)
+          return Number.isFinite(n) ? n : fallback
+        }
+        normalized.time_prefs = normalized.time_prefs.map(t => ({
+          ...t,
+          fanout: toInt(t.fanout ?? 4, 4),
+          parallel: toInt(t.parallel ?? 1, 1),
+          priority: toInt(t.priority ?? 1, 1)
+        }))
+      }
+      if (!Array.isArray(normalized.schedule_weekdays)) {
+        normalized.schedule_weekdays = [...DEFAULT_SCHEDULE_WEEKDAYS]
+      } else {
+        normalized.schedule_weekdays = [...new Set(normalized.schedule_weekdays.map(Number))]
+          .filter(v => v >= 0 && v <= 6)
+          .sort((a, b) => a - b)
+      }
+      return normalized
+    }
+    function parseLocalDateTime(value) {
+      if (!value) return null
+      const m = String(value).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/)
+      if (!m) return null
+      return new Date(
+        Number(m[1]),
+        Number(m[2]) - 1,
+        Number(m[3]),
+        Number(m[4]),
+        Number(m[5]),
+        Number(m[6] || 0),
+        0
+      )
+    }
+    function syncCountdownFromProfile(profile) {
+      if (!profile || !profile.next_schedule_at || currentStatus.value !== 'waiting') {
+        stopCountdown()
+        return
+      }
+      startCountdown(profile.next_schedule_at)
+    }
+
+    // ---- Auth ----
+    async function doLogin() {
+      loginError.value = ''
+      loggingIn.value = true
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({username: loginUsername.value, password: loginPassword.value})
+        })
+        if (!res.ok) {
+          loginError.value = res.status === 401 ? '用户名或密码错误' : `登录失败 (${res.status})`
+          loggingIn.value = false
+          return
+        }
+        const data = await res.json()
+        authToken.value = data.token
+        authUser.value = data.username
+        isAdmin.value = data.is_admin
+        localStorage.setItem('auth_token', data.token)
+        localStorage.setItem('auth_user', data.username)
+        localStorage.setItem('auth_admin', String(data.is_admin))
+        loginUsername.value = ''
+        loginPassword.value = ''
+        await loadProfiles()
+        if (data.is_admin) {
+          await loadInviteCodes()
+        }
+        connectStatusWs()
+        startStatusPoll()
+      } catch (e) {
+        loginError.value = '网络错误'
+      }
+      loggingIn.value = false
+    }
+
+    function doLogout() {
+      apiFetch('/api/logout', {method: 'POST'})
+      authToken.value = ''
+      authUser.value = ''
+      isAdmin.value = false
+      localStorage.removeItem('auth_token')
+      localStorage.removeItem('auth_user')
+      localStorage.removeItem('auth_admin')
+      profiles.value = []
+      current.value = null
+      currentId.value = null
+      view.value = 'dashboard'
+    }
+
+    // ---- Registration ----
+    async function doRegister() {
+      regError.value = ''
+      regSuccess.value = ''
+      registering.value = true
+      try {
+        const res = await fetch('/api/register', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({username: regUsername.value, password: regPassword.value, invite_code: regInviteCode.value})
+        })
+        const data = await res.json()
+        if (!res.ok) {
+          regError.value = data.detail || '注册失败'
+        } else {
+          regSuccess.value = '注册成功！请返回登录页面登录'
+          regUsername.value = ''
+          regPassword.value = ''
+          regInviteCode.value = ''
+        }
+      } catch (e) {
+        regError.value = '网络错误'
+      }
+      registering.value = false
+    }
+
+    // ---- Invite Codes (admin) ----
+    async function loadInviteCodes() {
+      const data = await apiJson('/api/invite-codes')
+      inviteCodes.value = data || []
+    }
+
+    async function generateInviteCode() {
+      const data = await apiJson('/api/invite-codes', {method: 'POST'})
+      if (data) await loadInviteCodes()
+    }
+
+    async function deleteInviteCode(code) {
+      if (!confirm(`删除邀请码 ${code}？`)) return
+      await apiFetch(`/api/invite-codes/${code}`, {method: 'DELETE'})
+      await loadInviteCodes()
+    }
+
+
+    // ---- API helpers ----
+    async function apiFetch(url, opts = {}) {
+      try {
+        if (!opts.headers) opts.headers = {}
+        if (authToken.value) opts.headers['Authorization'] = `Bearer ${authToken.value}`
+        const res = await fetch(url, opts)
+        if (res.status === 401) {
+          // Token expired, force logout
+          doLogout()
+          return null
+        }
+        if (!res.ok && res.status !== 409) {
+          const text = await res.text().catch(() => '')
+          console.error(`API ${res.status}: ${url}`, text)
+        }
+        return res
+      } catch (e) {
+        console.error(`API error: ${url}`, e)
+        return null
+      }
+    }
+    async function apiJson(url, opts = {}) {
+      const res = await apiFetch(url, opts)
+      if (!res) return null
+      try { return await res.json() } catch { return null }
+    }
+
+    // ---- API ----
+    async function loadProfiles() {
+      const data = await apiJson('/api/profiles')
+      if (data) {
+        profiles.value = data.map(normalizeProfileData)
+        if (current.value) syncCountdownFromProfile(current.value)
+      }
+    }
+    async function refreshCurrentProfile() {
+      if (!currentId.value) return
+      const data = await apiJson(`/api/profiles/${currentId.value}`)
+      if (data) {
+        current.value = normalizeProfileData(data)
+        syncCountdownFromProfile(current.value)
+      }
+    }
+    async function selectProfile(id) {
+      stopCountdown()
+      courtData.value = null
+      currentId.value = id
+      view.value = 'profile'
+      tab.value = 'booking'
+      loginResult.value = null
+      selectedLogDate.value = ''
+      historyLogContent.value = ''
+      orders.value = null
+      ordersError.value = ''
+      newPassword.value = ''
+      changePwResult.value = null
+      const data = await apiJson(`/api/profiles/${id}`)
+      if (data) {
+        current.value = normalizeProfileData(data)
+        syncCountdownFromProfile(current.value)
+      }
+      logs.value = []
+      connectWs(id)
+      refreshLogFiles()
+    }
+    async function addProfile() {
+      const p = await apiJson('/api/profiles', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' })
+      if (!p) return
+      await loadProfiles()
+      selectProfile(p.id)
+    }
+    async function deleteProfile() {
+      if (!confirm('确定删除该账户？')) return
+      stopCountdown()
+      disconnectWs()
+      await apiFetch(`/api/profiles/${currentId.value}`, { method:'DELETE' })
+      current.value = null
+      currentId.value = null
+      view.value = 'dashboard'
+      logs.value = []
+      courtData.value = null
+      await loadProfiles()
+    }
+    async function cloneProfile() {
+      if (cloning.value) return
+      cloning.value = true
+      try {
+        await saveProfileNow()
+        const cloned = await apiJson(`/api/profiles/${currentId.value}/clone`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}'
+        })
+        if (!cloned) return
+        await loadProfiles()
+        await selectProfile(cloned.id)
+      } finally {
+        cloning.value = false
+      }
+    }
+
+    let saveTimer = null
+    function saveProfile() {
+      clearTimeout(saveTimer)
+      saveTimer = setTimeout(() => saveProfileNow(), 400)
+    }
+    async function saveProfileNow() {
+      clearTimeout(saveTimer)
+      if (!current.value || !currentId.value) return
+      const body = { ...current.value }
+      delete body.id; delete body.created_at; delete body.updated_at; delete body.status; delete body.next_schedule_at
+      delete body.latest_booking_result; delete body.latest_booking_result_at; delete body.latest_booking_result_unread
+      const data = await apiJson(`/api/profiles/${currentId.value}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      })
+      if (data) {
+        current.value = normalizeProfileData(data)
+        syncCountdownFromProfile(current.value)
+      }
+      await loadProfiles()
+    }
+
+    // ---- Actions ----
+    async function testLogin() {
+      loginTesting.value = true
+      loginResult.value = null
+      try {
+        const r = await apiJson(`/api/profiles/${currentId.value}/login`, { method:'POST' })
+        loginResult.value = r ? r.success : false
+      } catch { loginResult.value = false }
+      loginTesting.value = false
+    }
+    async function startScheduled() {
+      await saveProfileNow()
+      const r = await apiJson(`/api/profiles/${currentId.value}/start`, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{"immediate":false}' })
+      await loadProfiles()
+      await refreshCurrentProfile()
+      if (r && r.next_schedule_at) startCountdown(r.next_schedule_at)
+    }
+    async function startImmediate() {
+      await saveProfileNow()
+      await apiFetch(`/api/profiles/${currentId.value}/start`, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{"immediate":true}' })
+      await loadProfiles()
+      stopCountdown()
+    }
+    async function stopBooking() {
+      await apiFetch(`/api/profiles/${currentId.value}/stop`, { method:'POST' })
+      stopCountdown()
+      await loadProfiles()
+      await refreshCurrentProfile()
+    }
+
+    // ---- Court Query ----
+    async function queryCourtStatus() {
+      if (!current.value) return
+      querying.value = true
+      courtData.value = null
+
+      const days = current.value.target_days
+      const selectedDays = days && days.length ? days : [2]
+
+      // Build date strings for all selected days
+      const dates = selectedDays.map(day => {
+        const d = new Date()
+        d.setDate(d.getDate() + day)
+        return {
+          day,
+          label: dayLabel(day),
+          dateStr: `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+        }
+      })
+      queryDate.value = dates.map(d => `${d.label}(${d.dateStr})`).join(' / ')
+
+      const enabledVenues = (current.value.venue_prefs || []).filter(v => v.enabled)
+      if (!enabledVenues.length) { querying.value = false; return }
+
+      const results = []
+      // Query each date x venue combination
+      for (const dateInfo of dates) {
+        for (const vp of enabledVenues) {
+          const venueInfo = VENUES.find(x => x.id === vp.id)
+          if (!venueInfo) continue
+          const data = await apiJson(`/api/venues/query?venue_id=${vp.id}&date=${dateInfo.dateStr}`)
+          if (!data || !data.length) continue
+          const slots = data.map(slot => {
+            const seatMap = {}
+            for (const s of (slot.seats || [])) {
+              seatMap[s.courtNumber] = { available: s.available, seatId: s.seatId }
+            }
+            const seats = []
+            for (let c = 1; c <= venueInfo.totalCourts; c++) {
+              const info = seatMap[c]
+              seats.push({
+                court: c,
+                available: !!(info && info.available),
+                seatId: info ? info.seatId : null,
+                booking: false  // reactive flag for booking animation
+              })
+            }
+            return { time: slot.time, stockId: slot.stockId, seats }
+          })
+          results.push({
+            id: vp.id,
+            venueId: vp.id,
+            venueName: venueInfo.name,
+            date: dateInfo.dateStr,
+            name: `${venueInfo.name} - ${dateInfo.label}(${dateInfo.dateStr})`,
+            totalCourts: venueInfo.totalCourts,
+            slots
+          })
+        }
+      }
+      courtData.value = results
+      querying.value = false
+    }
+
+    // ---- Book single court (double-click) ----
+    async function bookCourt(venue, slot, seat) {
+      if (!currentId.value || !seat.available || seat.booking || !seat.seatId) return
+      if (!confirm(`确定预订 ${venue.venueName} ${slot.time} 场地${seat.court}？`)) return
+
+      seat.booking = true
+      try {
+        const body = {
+          venue_id: venue.venueId,
+          venue_name: venue.venueName,
+          date: venue.date,
+          time_slot: slot.time,
+          stock_id: slot.stockId,
+          court_number: seat.court,
+          seat_id: seat.seatId
+        }
+        // Use AbortController for 20s timeout
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), 20000)
+        const result = await apiJson(
+          `/api/profiles/${currentId.value}/book-court`,
+          { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body), signal: controller.signal }
+        )
+        clearTimeout(timer)
+        if (result && result.success) {
+          seat.available = false
+          alert(`预订成功: ${venue.venueName} ${slot.time} 场地${seat.court}`)
+        } else {
+          alert(`预订失败: ${result ? result.message : '请求超时或服务异常'}`)
+        }
+      } catch (e) {
+        alert(`预订异常: ${e.name === 'AbortError' ? '请求超时(20s)，请检查滑块服务是否启动' : e.message}`)
+      } finally {
+        seat.booking = false
+      }
+    }
+
+    // ---- Preferences helpers ----
+    function toggleDay(d) {
+      const idx = current.value.target_days.indexOf(d)
+      if (idx >= 0) current.value.target_days.splice(idx, 1)
+      else current.value.target_days.push(d)
+      current.value.target_days.sort((a,b) => a-b)
+      saveProfile()
+    }
+    function toggleScheduleWeekday(d) {
+      const idx = current.value.schedule_weekdays.indexOf(d)
+      if (idx >= 0) current.value.schedule_weekdays.splice(idx, 1)
+      else current.value.schedule_weekdays.push(d)
+      current.value.schedule_weekdays.sort((a, b) => a - b)
+      saveProfile()
+    }
+    function toggleCourt(vi, c) {
+      const v = current.value.venue_prefs[vi]
+      const idx = v.courts.indexOf(c)
+      if (idx >= 0) v.courts.splice(idx, 1)
+      else v.courts.push(c)
+      v.courts.sort((a,b) => a-b)
+      saveProfile()
+    }
+    function cyclePriority(vi, c) {
+      const v = current.value.venue_prefs[vi]
+      if (!v.courtPriority) v.courtPriority = {}
+      const cur = v.courtPriority[String(c)] || 1
+      v.courtPriority[String(c)] = cur >= 6 ? 1 : cur + 1
+      saveProfile()
+    }
+    function clearLogs() { logs.value = []; selectedLogDate.value = ''; historyLogContent.value = '' }
+
+    // Computed: show realtime logs or history content
+    const displayLogs = computed(() => {
+      if (selectedLogDate.value && historyLogContent.value) {
+        return historyLogContent.value.split('\n').filter(l => l.trim())
+      }
+      return logs.value.map(l => `[${l.ts}] ${l.msg}`)
+    })
+
+    async function changePassword() {
+      if (!newPassword.value) return
+      changingPassword.value = true
+      changePwResult.value = null
+      try {
+        const res = await apiFetch(`/api/profiles/${currentId.value}/change-password`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({new_password: newPassword.value})
+        })
+        if (res && res.ok) {
+          changePwResult.value = {ok: true, msg: '密码已更新'}
+          newPassword.value = ''
+        } else {
+          const data = await res?.json().catch(() => null)
+          changePwResult.value = {ok: false, msg: data?.detail || '更新失败，请检查新密码是否正确'}
+        }
+      } catch {
+        changePwResult.value = {ok: false, msg: '网络错误'}
+      }
+      changingPassword.value = false
+    }
+
+    async function loadOrders() {
+      if (!currentId.value) return
+      loadingOrders.value = true
+      ordersError.value = ''
+      try {
+        const res = await apiFetch(`/api/profiles/${currentId.value}/orders`)
+        const data = await res?.json().catch(() => null)
+        if (res && res.ok && Array.isArray(data)) {
+          orders.value = data
+        } else {
+          orders.value = []
+          ordersError.value = data?.detail || '订单刷新失败'
+        }
+      } finally {
+        loadingOrders.value = false
+      }
+    }
+    async function markLatestBookingRead() {
+      if (!currentId.value) return
+      const data = await apiJson(`/api/profiles/${currentId.value}/latest-booking/read`, { method:'POST' })
+      if (!data) return
+      current.value = normalizeProfileData(data)
+      const idx = profiles.value.findIndex(x => x.id === currentId.value)
+      if (idx >= 0) profiles.value[idx] = normalizeProfileData(data)
+    }
+
+    async function refreshLogFiles() {
+      if (!currentId.value) return
+      const data = await apiJson(`/api/profiles/${currentId.value}/logs`)
+      logFiles.value = data || []
+    }
+
+    async function loadHistoryLog() {
+      if (!selectedLogDate.value) {
+        historyLogContent.value = ''
+        return
+      }
+      const data = await apiJson(`/api/profiles/${currentId.value}/logs/${encodeURIComponent(selectedLogDate.value)}`)
+      if (data) {
+        historyLogContent.value = data.content
+        nextTick(() => {
+          if (logConsole.value) logConsole.value.scrollTop = logConsole.value.scrollHeight
+        })
+      }
+    }
+
+    // ---- WebSocket ----
+    let wsProfileId = null
+    function connectWs(profileId) {
+      disconnectWs()
+      wsProfileId = profileId
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      ws = new WebSocket(`${proto}//${location.host}/ws/logs/${profileId}`)
+      ws.onmessage = (e) => {
+        const entry = JSON.parse(e.data)
+        logs.value.push(entry)
+        if (logs.value.length > 500) logs.value.splice(0, logs.value.length - 500)
+        nextTick(() => {
+          if (logConsole.value) logConsole.value.scrollTop = logConsole.value.scrollHeight
+        })
+      }
+      ws.onclose = () => {
+        ws = null
+        if (currentId.value === profileId && view.value === 'profile') {
+          setTimeout(() => connectWs(profileId), 2000)
+        }
+      }
+      ws.onerror = () => {}
+    }
+    function disconnectWs() {
+      wsProfileId = null
+      if (ws) { try { ws.close() } catch {} ws = null }
+    }
+    function connectStatusWs() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      wsStatus = new WebSocket(`${proto}//${location.host}/ws/status`)
+      wsStatus.onmessage = (e) => {
+        const d = JSON.parse(e.data)
+        if (d.profile_id) {
+          lastLogs[d.profile_id] = `[${d.ts}] ${d.msg}`
+          const p = profiles.value.find(x => x.id === d.profile_id)
+          if (p && d.status) p.status = d.status
+        }
+      }
+      wsStatus.onclose = () => { setTimeout(connectStatusWs, 2000) }
+    }
+
+    // ---- Countdown ----
+    function startCountdown(targetValue) {
+      stopCountdown()
+      countdownTimer = setInterval(() => {
+        const now = new Date()
+        const target = parseLocalDateTime(targetValue)
+        if (!target) { stopCountdown(); return }
+        const left = target - now
+        if (left <= 0) { countdown.value = '执行中...'; stopCountdown(); return }
+        const hh = Math.floor(left/3600000)
+        const mm = Math.floor((left%3600000)/60000)
+        const ss = Math.floor((left%60000)/1000)
+        countdown.value = `倒计时: ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`
+      }, 200)
+    }
+    function stopCountdown() {
+      if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null }
+      countdown.value = ''
+    }
+
+    // ---- Status polling ----
+    let statusTimer = null
+    function startStatusPoll() {
+      statusTimer = setInterval(async () => {
+        await loadProfiles()
+        if (currentId.value && view.value === 'profile') {
+          await refreshCurrentProfile()
+        }
+      }, 3000)
+    }
+
+    onMounted(async () => {
+      loadCollapsedGroups()
+      if (authToken.value) {
+        await loadProfiles()
+        if (isAdmin.value) {
+          await loadInviteCodes()
+        }
+        connectStatusWs()
+        startStatusPoll()
+      }
+    })
+    onUnmounted(() => {
+      disconnectWs()
+      if (wsStatus) wsStatus.close()
+      if (statusTimer) clearInterval(statusTimer)
+      stopCountdown()
+    })
+
+    return {
+      // Auth
+      authToken, authUser, isAdmin,
+      loginUsername, loginPassword, loginError, loggingIn,
+      doLogin, doLogout,
+      showRegister, regUsername, regPassword, regInviteCode, regError, regSuccess, registering, doRegister,
+      inviteCodes, loadInviteCodes, generateInviteCode, deleteInviteCode,
+      // App
+      profiles, groupedProfiles, showGroupLabels, isGroupCollapsed, toggleGroupCollapsed, view, currentId, current, tab, logs, lastLogs,
+      loginTesting, loginResult, cloning, countdown, logConsole, currentStatus,
+      querying, courtData, queryDate,
+      statusColor, statusLabel, dayLabel, weekdayLabel, allCourts,
+      loadProfiles, selectProfile, addProfile, deleteProfile, cloneProfile, saveProfile,
+      testLogin, startScheduled, startImmediate, stopBooking,
+      queryCourtStatus, bookCourt,
+      toggleDay, toggleScheduleWeekday, toggleCourt, cyclePriority, clearLogs,
+      logFiles, selectedLogDate, displayLogs, refreshLogFiles, loadHistoryLog,
+      orders, loadingOrders, ordersError, loadOrders, markLatestBookingRead,
+      newPassword, changingPassword, changePwResult, changePassword
+    }
+  }
+}).mount('#app')
+</script>
+</body>
+</html>
