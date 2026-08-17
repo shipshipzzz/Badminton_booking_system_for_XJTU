@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -330,12 +330,15 @@ input:focus, select:focus { border-color:#1e88e5; }
                 </thead>
                 <tbody>
                   <tr v-for="slot in venue.slots" :key="slot.time">
-                    <td class="time-cell">{{ slot.time }}</td>
+                    <td class="time-cell">
+                      {{ slot.time }}
+                      <div v-if="!slot.detailOk && slot.surplus > 0" style="color:#1565c0;font-weight:700">余{{ slot.surplus }}</div>
+                    </td>
                     <td v-for="seat in slot.seats" :key="seat.court"
-                        :class="seat.available ? (seat.booking ? 'cell-booking' : 'cell-ok') : 'cell-no'"
+                        :class="seat.available ? (seat.booking ? 'cell-booking' : 'cell-ok') : ((slot.detailOk || slot.surplus<=0) ? 'cell-no' : 'cell-ok')"
                         :style="seat.available && !seat.booking ? {cursor:'pointer'} : {}"
                         @click="bookCourt(venue, slot, seat)">
-                      {{ seat.booking ? '预订中' : (seat.available ? '¥0' : '无') }}
+                      {{ seat.booking ? '预订中' : (seat.available ? '¥0' : (slot.detailOk ? '无' : (slot.surplus>0 ? '有' : '无'))) }}
                     </td>
                   </tr>
                 </tbody>
@@ -744,7 +747,10 @@ createApp({
     }
 
     function doLogout() {
-      apiFetch('/api/logout', {method: 'POST'})
+      stopStatusPoll()
+      disconnectWs()
+      if (wsStatus) { try { wsStatus.close() } catch {} wsStatus = null }
+      const token = authToken.value
       authToken.value = ''
       authUser.value = ''
       isAdmin.value = false
@@ -755,6 +761,9 @@ createApp({
       current.value = null
       currentId.value = null
       view.value = 'dashboard'
+      if (token) {
+        fetch('/api/logout', { method: 'POST', headers: { Authorization: `Bearer ${token}` } }).catch(() => {})
+      }
     }
 
     // ---- Registration ----
@@ -807,8 +816,7 @@ createApp({
         if (authToken.value) opts.headers['Authorization'] = `Bearer ${authToken.value}`
         const res = await fetch(url, opts)
         if (res.status === 401) {
-          // Token expired, force logout
-          doLogout()
+          if (authToken.value && url !== '/api/logout') doLogout()
           return null
         }
         if (!res.ok && res.status !== 409) {
@@ -828,20 +836,47 @@ createApp({
     }
 
     // ---- API ----
-    async function loadProfiles() {
-      const data = await apiJson('/api/profiles')
-      if (data) {
-        profiles.value = data.map(normalizeProfileData)
-        if (current.value) syncCountdownFromProfile(current.value)
+    const RUNTIME_FIELDS = [
+      'status', 'next_schedule_at',
+      'latest_booking_result', 'latest_booking_result_at', 'latest_booking_result_unread',
+      'updated_at'
+    ]
+    function applyRuntimeFields(target, source) {
+      if (!target || !source) return
+      for (const key of RUNTIME_FIELDS) {
+        if (key in source) target[key] = source[key]
       }
     }
-    async function refreshCurrentProfile() {
+    function isEditingForm() {
+      const el = document.activeElement
+      if (!el) return false
+      const tag = (el.tagName || '').toLowerCase()
+      return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable
+    }
+    async function loadProfiles() {
+      const data = await apiJson('/api/profiles')
+      if (!data) return
+      const incoming = data.map(normalizeProfileData)
+      const byId = new Map(profiles.value.map(p => [p.id, p]))
+      profiles.value = incoming.map(p => {
+        const existing = byId.get(p.id)
+        if (!existing) return p
+        Object.assign(existing, p)
+        return existing
+      })
+      if (current.value) syncCountdownFromProfile(current.value)
+    }
+    async function refreshCurrentProfile(opts = {}) {
       if (!currentId.value) return
       const data = await apiJson(`/api/profiles/${currentId.value}`)
-      if (data) {
-        current.value = normalizeProfileData(data)
-        syncCountdownFromProfile(current.value)
+      if (!data) return
+      const normalized = normalizeProfileData(data)
+      if (opts.runtimeOnly && current.value && current.value.id === normalized.id) {
+        applyRuntimeFields(current.value, normalized)
+      } else {
+        current.value = normalized
       }
+      syncCountdownFromProfile(current.value)
     }
     async function selectProfile(id) {
       stopCountdown()
@@ -992,8 +1027,10 @@ createApp({
               seatMap[s.courtNumber] = { available: s.available, seatId: s.seatId }
             }
             const seats = []
+            let detailOk = false
             for (let c = 1; c <= venueInfo.totalCourts; c++) {
               const info = seatMap[c]
+              if (info && info.seatId) detailOk = true
               seats.push({
                 court: c,
                 available: !!(info && info.available),
@@ -1001,7 +1038,13 @@ createApp({
                 booking: false  // reactive flag for booking animation
               })
             }
-            return { time: slot.time, stockId: slot.stockId, seats }
+            return {
+              time: slot.time,
+              stockId: slot.stockId,
+              surplus: Number(slot.surplus || 0),
+              detailOk,
+              seats
+            }
           })
           results.push({
             id: vp.id,
@@ -1226,19 +1269,32 @@ createApp({
 
     // ---- Status polling ----
     let statusTimer = null
+    let statusPollInFlight = false
     function startStatusPoll() {
+      if (statusTimer) clearInterval(statusTimer)
       statusTimer = setInterval(async () => {
-        await loadProfiles()
-        if (currentId.value && view.value === 'profile') {
-          await refreshCurrentProfile()
+        if (statusPollInFlight || !authToken.value) return
+        statusPollInFlight = true
+        try {
+          await loadProfiles()
+          if (currentId.value && view.value === 'profile' && !isEditingForm()) {
+            await refreshCurrentProfile({ runtimeOnly: true })
+          }
+        } finally {
+          statusPollInFlight = false
         }
       }, 3000)
+    }
+    function stopStatusPoll() {
+      if (statusTimer) { clearInterval(statusTimer); statusTimer = null }
+      statusPollInFlight = false
     }
 
     onMounted(async () => {
       loadCollapsedGroups()
       if (authToken.value) {
         await loadProfiles()
+        if (!authToken.value) return
         if (isAdmin.value) {
           await loadInviteCodes()
         }
@@ -1249,7 +1305,7 @@ createApp({
     onUnmounted(() => {
       disconnectWs()
       if (wsStatus) wsStatus.close()
-      if (statusTimer) clearInterval(statusTimer)
+      stopStatusPoll()
       stopCountdown()
     })
 

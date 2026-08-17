@@ -266,7 +266,7 @@ async def _run_login_check(profile_id: int):
 
     def _check():
         if rt.client:
-            log_manager.emit(profile_id, f"[T-{LOGIN_LEAD_SECONDS}s] Session exists, verifying with /order/seachMyOrder.html...")
+            log_manager.emit(profile_id, f"[T-{LOGIN_LEAD_SECONDS}s] Session exists, verifying with /web/order/seachMyOrder.html...")
             try:
                 valid, reason = booking_engine.verify_booking_session(rt.client)
                 if valid:

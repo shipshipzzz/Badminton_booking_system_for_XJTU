@@ -40,6 +40,7 @@ from booking_api import (  # noqa: E402
 
 import httpx  # noqa: E402
 import log_manager  # noqa: E402
+from site_config import ORDERS_CHECK_URL, USER_AGENT  # noqa: E402
 
 VENUES = [
     {"id": 101, "name": "一号巨构", "totalCourts": 3},
@@ -159,9 +160,8 @@ CAPTCHA_PREFETCH_MAX_WORKERS = 6
 QUERY_MAX_WORKERS = 12
 DISPLAY_SCALE_RATIO = 260 / 590
 ANON_CLIENT_POOL_SIZE = QUERY_MAX_WORKERS + CAPTCHA_PREFETCH_MAX_WORKERS
-BOOKING_HOST = "http://202.117.17.144"
 ANON_CLIENT_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": USER_AGENT,
     "X-Requested-With": "XMLHttpRequest",
 }
 AUTH_CHECK_HEADERS = {
@@ -332,47 +332,67 @@ def query_times_anonymous(venue_id: int, date: str) -> list:
         return query_times(client, venue_id, date)
 
 
-def query_seats_anonymous(venue_id: int, stock_id: str) -> list:
+def query_seats_anonymous(venue_id: int, stock_id: str, date: str = "") -> list:
     with lease_anonymous_client() as client:
-        return query_seats(client, venue_id, stock_id)
+        return query_seats(client, venue_id, stock_id, date or None)
+
+
+def _has_booking_cookies(client: httpx.Client) -> bool:
+    for cookie in client.cookies.jar:
+        domain = (cookie.domain or "").lstrip(".")
+        if cookie.name in ("SESSION", "JSESSIONID") and (
+            "202.117.17.144" in domain or domain in ("", "localhost")
+        ):
+            return True
+    return False
 
 
 def verify_booking_session(client: httpx.Client | None) -> tuple[bool, str]:
     if client is None:
         return False, "no client"
 
+    cookie_snapshot = list(client.cookies.jar)
+    last_reason = "no response"
+    resp = None
+    for attempt in range(4):
+        try:
+            resp = client.get(
+                ORDERS_CHECK_URL,
+                params={"page": 1, "rows": 1, "sort": "createdate", "order": "desc"},
+                headers=AUTH_CHECK_HEADERS,
+                timeout=8,
+                follow_redirects=False,
+            )
+        except Exception as e:
+            last_reason = f"request failed: {e}"
+            time.sleep(0.4 * (attempt + 1))
+            continue
+
+        if resp.status_code in (301, 302, 303, 307, 308):
+            last_reason = f"redirect {resp.status_code} -> {resp.headers.get('location', '')[:120]}"
+            break
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except Exception:
+                last_reason = "non-json body"
+            else:
+                if isinstance(data, dict) and ("rows" in data or "total" in data):
+                    return True, f"rows={len(data.get('rows', []))}"
+                last_reason = "unexpected payload"
+            break
+        last_reason = f"status={resp.status_code}"
+        if resp.status_code < 500:
+            break
+        time.sleep(0.4 * (attempt + 1))
+
     try:
-        resp = client.get(
-            f"{BOOKING_HOST}/order/seachMyOrder.html",
-            params={"page": 1, "rows": 1, "sort": "createdate", "order": "desc"},
-            headers=AUTH_CHECK_HEADERS,
-            timeout=5,
-            follow_redirects=False,
-        )
-    except Exception as e:
-        return False, f"request failed: {e}"
-
-    if resp.status_code in (301, 302, 303, 307, 308):
-        location = resp.headers.get("location", "")
-        return False, f"redirect {resp.status_code} -> {location[:120]}"
-
-    if resp.status_code != 200:
-        return False, f"status={resp.status_code}"
-
-    try:
-        data = resp.json()
+        client.cookies.jar.clear()
+        for cookie in cookie_snapshot:
+            client.cookies.jar.set_cookie(cookie)
     except Exception:
-        text = resp.text[:120].replace("\r", " ").replace("\n", " ")
-        return False, f"non-json body: {text}"
-
-    if isinstance(data, dict) and ("rows" in data or "total" in data):
-        return True, f"rows={len(data.get('rows', []))}"
-
-    if isinstance(data, dict):
-        msg = data.get("message") or data.get("msg") or str(data)[:120]
-        return False, f"unexpected payload: {msg}"
-
-    return False, f"unexpected payload type: {type(data).__name__}"
+        pass
+    return False, last_reason
 
 
 # ==================== Step 1: Login (T-60s) ====================
@@ -396,14 +416,18 @@ def do_login(profile_id: int, username: str, password: str) -> bool:
         client = cas.login(username, password)
         session_valid, session_reason = verify_booking_session(client)
         if not session_valid:
-            try:
-                client.close()
-            except Exception:
-                pass
-            rt.client = None
-            mark_session_ready(rt, False, session_reason)
-            log(f"[Login] CAS login returned unusable session ({session_reason})")
-            return False
+            transient = session_reason.startswith("status=5") or session_reason.startswith("request failed")
+            if transient and _has_booking_cookies(client):
+                log(f"[Login] CAS login accepted; orders API still {session_reason}")
+            else:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                rt.client = None
+                mark_session_ready(rt, False, session_reason)
+                log(f"[Login] CAS login returned unusable session ({session_reason})")
+                return False
 
         rt.client = client
         mark_session_ready(rt, False, "awaiting T-2s validation")
@@ -536,7 +560,7 @@ def do_query_candidates(profile_id: int, profile: dict) -> dict:
         seat_workers = min(QUERY_MAX_WORKERS, len(seat_jobs))
         with ThreadPoolExecutor(max_workers=seat_workers) as executor:
             future_to_job = {
-                executor.submit(query_seats_anonymous, vp["id"], slot["ID"]): (tp, vp, slot)
+                executor.submit(query_seats_anonymous, vp["id"], slot["ID"], date): (tp, vp, slot)
                 for tp, vp, slot in seat_jobs
             }
             for future in future_to_job:

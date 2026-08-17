@@ -1,52 +1,146 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""HTTP helpers for the XJTU badminton booking system."""
+"""HTTP helpers for the XJTU badminton booking system (campus-app H5 on :8080/web)."""
 
 import json
 import math
 import random
-import re
+import threading
 import time
 from urllib.parse import urlencode
 
 import httpx
 
+from site_config import CAPTCHA_URL, YZM_ORIGIN, api_url
 
-HOST = "http://202.117.17.144"
+
 AJAX_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
+_OK_AREA_TTL = 2.5
+_ok_area_cache: dict = {}
+_ok_area_lock = threading.Lock()
+
+
+def _get_with_retry(client, url, headers=None, retries=4, delay=0.35):
+    """Official site often returns empty HTTP 500; retry before giving up."""
+    last = None
+    for attempt in range(retries):
+        last = client.get(url, headers=headers or AJAX_HEADERS, timeout=10)
+        if last.status_code == 200 and last.content:
+            return last
+        time.sleep(delay * (attempt + 1))
+    return last
+
+
+def _ok_area_cache_get(venue_id, date):
+    key = (int(venue_id), str(date))
+    now = time.time()
+    with _ok_area_lock:
+        hit = _ok_area_cache.get(key)
+        if hit and now - hit[0] < _OK_AREA_TTL:
+            return hit[1]
+    return None
+
+
+def _ok_area_cache_put(venue_id, date, rows):
+    key = (int(venue_id), str(date))
+    with _ok_area_lock:
+        _ok_area_cache[key] = (time.time(), rows)
+
+
+def _ok_area_cache_by_stock(venue_id, stock_id):
+    sid = str(stock_id)
+    with _ok_area_lock:
+        items = list(_ok_area_cache.items())
+    for (cached_venue, _date), (_ts, rows) in items:
+        if int(cached_venue) != int(venue_id):
+            continue
+        if any(str(row.get("stockid")) == sid for row in rows):
+            return rows
+    return None
+
+
+def fetch_ok_area(client, venue_id, date):
+    cached = _ok_area_cache_get(venue_id, date)
+    if cached is not None:
+        return cached
+    url = api_url(f"/product/findOkArea.html?s_date={date}&serviceid={venue_id}&_={int(time.time()*1000)}")
+    resp = _get_with_retry(client, url)
+    if resp is None or resp.status_code != 200 or not resp.content:
+        return []
+    try:
+        data = resp.json()
+    except Exception:
+        return []
+    rows = data.get("object") or []
+    if not isinstance(rows, list):
+        return []
+    _ok_area_cache_put(venue_id, date, rows)
+    return rows
+
+
+def _times_from_ok_area(rows):
+    by_stock = {}
+    for row in rows:
+        stock_id = row.get("stockid")
+        if stock_id is None:
+            continue
+        stock = row.get("stock") or {}
+        entry = by_stock.setdefault(str(stock_id), {
+            "ID": stock_id,
+            "TIME_NO": stock.get("time_no") or "",
+            "SURPLUS": 0,
+            "ALL_COUNT": int(stock.get("all_count") or 0),
+        })
+        if row.get("status") == 1:
+            entry["SURPLUS"] += 1
+        entry["ALL_COUNT"] = max(int(entry["ALL_COUNT"] or 0), int(entry["SURPLUS"]), int(row.get("num") or 0))
+    return sorted(by_stock.values(), key=lambda item: item.get("TIME_NO") or "")
 
 
 def query_times(client, venue_id, date):
-    url = f"{HOST}/product/findtime.html?type=day&s_dates={date}&serviceid={venue_id}&_={int(time.time()*1000)}"
-    resp = client.get(url, headers=AJAX_HEADERS, timeout=10)
-    data = resp.json()
+    rows = fetch_ok_area(client, venue_id, date)
+    times = _times_from_ok_area(rows)
+    if times:
+        return times
+
+    url = api_url(f"/product/findtime.html?type=day&s_dates={date}&serviceid={venue_id}&_={int(time.time()*1000)}")
+    resp = _get_with_retry(client, url)
+    if resp is None or resp.status_code != 200:
+        return []
+    try:
+        data = resp.json()
+    except Exception:
+        return []
     if data.get("result") == "1":
         return data.get("object", [])
     return []
 
 
-def query_seats(client, venue_id, stock_id):
-    url = f"{HOST}/seat/seat.html?id={venue_id}&type=2&stockid={stock_id}&json=html&_={int(time.time()*1000)}"
-    resp = client.get(url, headers=AJAX_HEADERS, timeout=10)
-    match = re.search(r'value="([^"]+)"\s+id="txt_seatid"', resp.text)
-    if not match:
-        return []
+def query_seats(client, venue_id, stock_id, date=None):
+    rows = fetch_ok_area(client, venue_id, date) if date else None
+    if rows is None:
+        rows = _ok_area_cache_by_stock(venue_id, stock_id) or []
+        if not rows and date:
+            rows = fetch_ok_area(client, venue_id, date)
+
     seats = []
-    for item in match.group(1).split(","):
-        if not item:
+    for row in rows:
+        if str(row.get("stockid")) != str(stock_id):
             continue
-        parts = item.split("_")
-        if len(parts) == 3:
-            seats.append({
-                "courtNumber": int(parts[0]),
-                "seatId": parts[1],
-                "available": parts[2] == "1",
-            })
+        try:
+            court_number = int(row.get("name") or row.get("num"))
+        except (TypeError, ValueError):
+            continue
+        seats.append({
+            "courtNumber": court_number,
+            "seatId": str(row.get("id")),
+            "available": row.get("status") == 1,
+        })
     return seats
 
 
 def fetch_captcha(client):
-    resp = client.get(f"{HOST}/gen?_={int(time.time()*1000)}",
+    resp = client.get(f"{CAPTCHA_URL}?_={int(time.time()*1000)}",
                       headers=AJAX_HEADERS, timeout=10)
     data = resp.json()
     captcha_id = data.get("id")
@@ -132,7 +226,7 @@ def generate_yzm_data(target_x, captcha_id):
         "entSlidingTime": start_time,
         "trackList": track_list,
     }
-    return json.dumps(yzm_data) + "synjones" + captcha_id + "synjones" + HOST
+    return json.dumps(yzm_data) + "synjones" + captcha_id + "synjones" + YZM_ORIGIN
 
 
 def submit_order(client, venue_id, stock_id, seat_id):
@@ -144,7 +238,7 @@ def submit_order(client, venue_id, stock_id, seat_id):
     }
     data = urlencode({"param": json.dumps(param)})
     resp = client.post(
-        f"{HOST}/order/show.html?id={venue_id}",
+        api_url(f"/order/show.html?id={venue_id}"),
         content=data,
         headers={
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -167,12 +261,14 @@ def submit_booking(client, venue_id, stock_id, seat_id, yzm_data):
         "shoppingcart": "0",
         "subscriber": "0",
         "stock": {str(stock_id): "1"},
-        "stockdetail": {str(stock_id): seat_id},
-        "stockdetailids": seat_id,
+        "stockdetail": {str(stock_id): str(seat_id)},
+        "stockdetailids": str(seat_id),
+        "venueReason": "",
+        "fileUrl": "",
     }
     body = f"param={httpx.URL('?' + urlencode({'p': json.dumps(param)})).params['p']}&yzm={httpx.URL('?' + urlencode({'y': yzm_data})).params['y']}&json=true"
     resp = client.post(
-        f"{HOST}/order/book.html",
+        api_url("/order/tobook.html"),
         content=body,
         headers={
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",

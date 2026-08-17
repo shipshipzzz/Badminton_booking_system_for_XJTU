@@ -1,4 +1,4 @@
-﻿"""FastAPI application: REST + WebSocket + lifecycle + auth."""
+"""FastAPI application: REST + WebSocket + lifecycle + auth."""
 
 import asyncio
 import os
@@ -28,7 +28,7 @@ from models import ProfileCreate, ProfileUpdate, ProfileSummary, ProfileResponse
 # ==================== Auth ====================
 
 ADMIN_USERNAME = os.getenv("BOOKING_ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("BOOKING_ADMIN_PASSWORD")
+ADMIN_PASSWORD = os.getenv("BOOKING_ADMIN_PASSWORD", "admin")
 
 # In-memory session store: {token: {"username": str, "is_admin": bool}}
 _sessions: dict[str, dict] = {}
@@ -645,11 +645,11 @@ async def _ensure_profile_booking_session(profile_id: int, profile: dict, *,
 
 
 def _fetch_orders_once(client):
-    host = "http://202.117.17.144"
+    from site_config import ORDERS_CHECK_URL, ORDERS_DETAIL_URL
     headers = {"X-Requested-With": "XMLHttpRequest"}
     status_map = {1: "完成", 2: "已取消", 3: "待支付"}
     resp = client.get(
-        f"{host}/order/seachMyOrder.html",
+        ORDERS_CHECK_URL,
         params={"page": 1, "rows": 20, "sort": "createdate", "order": "desc"},
         headers=headers,
         timeout=10,
@@ -684,7 +684,7 @@ def _fetch_orders_once(client):
         }
         try:
             dr = client.get(
-                f"{host}/order/seachData.html",
+                ORDERS_DETAIL_URL,
                 params={"orderid": order_id, "page": 1, "rows": 1},
                 headers=headers,
                 timeout=5,
@@ -741,16 +741,22 @@ async def query_venues(venue_id: int, date: str):
         _sys.path.insert(0, _cas_path)
     import httpx
     from booking_api import query_times as _qt, query_seats as _qs
+    from site_config import USER_AGENT as _BOOKING_UA
 
     def _query():
-        client = httpx.Client(timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        client = httpx.Client(timeout=10, headers={"User-Agent": _BOOKING_UA})
         try:
             times = _qt(client, venue_id, date)
             result = []
             for t in times:
-                seats = _qs(client, venue_id, t["ID"])
-                result.append({"time": t["TIME_NO"], "stockId": t["ID"],
-                               "surplus": t.get("SURPLUS", 0), "seats": seats})
+                seats = _qs(client, venue_id, t["ID"], date)
+                result.append({
+                    "time": t["TIME_NO"],
+                    "stockId": t["ID"],
+                    "surplus": int(t.get("SURPLUS") or 0),
+                    "allCount": int(t.get("ALL_COUNT") or 0),
+                    "seats": seats,
+                })
             return result
         finally:
             client.close()
