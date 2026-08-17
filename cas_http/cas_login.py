@@ -39,16 +39,7 @@ from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.backends import default_backend
 import base64
 
-from site_config import (
-    CAS_LOGIN_ENTRY,
-    INDEX_URL,
-    ORDERS_CHECK_URL,
-    ORG_OAUTH_ENTRY,
-    USER_AGENT,
-    USERINFO_URL,
-    api_url,
-    rewrite_internal_url,
-)
+from site_config import get_channel, normalize_channel
 
 
 # ======================== 常量 ========================
@@ -174,11 +165,13 @@ class CASLogin:
     """
 
     def __init__(self, timeout: float = 15.0, fp_visitor_id: str = None,
-                 logger: Callable[[str], None] | None = None):
+                 logger: Callable[[str], None] | None = None, channel: str = "8080"):
         self.timeout = timeout
         self.fp_visitor_id = fp_visitor_id or DEFAULT_FP_VISITOR_ID
         self._public_key_pem: str | None = None
         self._logger = logger
+        self.channel = normalize_channel(channel)
+        self.cfg = get_channel(self.channel)
 
     def _log(self, message: str):
         try:
@@ -193,9 +186,8 @@ class CASLogin:
             except Exception:
                 pass
 
-    @staticmethod
-    def _rewrite_internal_url(url: str) -> str:
-        return rewrite_internal_url(url)
+    def _rewrite_internal_url(self, url: str) -> str:
+        return self.cfg.rewrite_internal_url(url)
 
     @staticmethod
     def _is_cas_login_page(url: str, html: str = "") -> bool:
@@ -315,20 +307,20 @@ class CASLogin:
         return resp
 
     def _open_login_entry(self, client: httpx.Client) -> httpx.Response:
-        self._log(f"[CAS] Step 1: 访问登录入口 {CAS_LOGIN_ENTRY}")
-        resp = client.get(CAS_LOGIN_ENTRY)
+        self._log(f"[CAS] Step 1: 访问登录入口 {self.cfg.cas_login_entry} ({self.cfg.label})")
+        resp = client.get(self.cfg.cas_login_entry)
         self._log(f"[CAS]   => 重定向到: {str(resp.url)[:100]}...")
         if self._is_cas_login_page(str(resp.url), resp.text):
             return resp
         if self._is_booking_entry_page(str(resp.url)):
             self._log("[CAS]   登录入口未跳转，清除 cookie 后重试")
             client.cookies.clear()
-            resp = client.get(CAS_LOGIN_ENTRY)
+            resp = client.get(self.cfg.cas_login_entry)
             self._log(f"[CAS]   => 重试后: {str(resp.url)[:100]}...")
             if self._is_cas_login_page(str(resp.url), resp.text):
                 return resp
             self._log("[CAS]   改走 OpenPlatform OAuth 入口")
-            resp = client.get(ORG_OAUTH_ENTRY)
+            resp = client.get(self.cfg.org_oauth_entry)
             self._log(f"[CAS]   => OAuth 入口: {str(resp.url)[:100]}...")
         return resp
 
@@ -353,7 +345,7 @@ class CASLogin:
         last_reason = "no response"
         for attempt in range(retries):
             resp = client.get(
-                ORDERS_CHECK_URL,
+                self.cfg.orders_check_url,
                 params={"page": 1, "rows": 1, "sort": "createdate", "order": "desc"},
                 headers=AUTH_CHECK_HEADERS,
                 follow_redirects=False,
@@ -379,7 +371,7 @@ class CASLogin:
 
     def _userinfo_looks_logged_in(self, client: httpx.Client) -> bool:
         try:
-            resp = client.get(USERINFO_URL, follow_redirects=False)
+            resp = client.get(self.cfg.userinfo_url, follow_redirects=False)
         except Exception:
             return False
         if resp.status_code != 200:
@@ -391,7 +383,7 @@ class CASLogin:
                                    oauth_url: str = "", oauth_html: str = "") -> None:
         self._log("[CAS] Step 7: 补全预订系统本地会话")
         try:
-            client.get(INDEX_URL, follow_redirects=True)
+            client.get(self.cfg.index_url, follow_redirects=True)
         except Exception as e:
             self._log(f"[CAS]   index.html 访问失败（忽略）: {e}")
 
@@ -404,7 +396,7 @@ class CASLogin:
             self._log("[CAS] Step 8: 跟随订单接口 SSO 补全预订会话")
             self._follow_sso(client, extra, username, password)
             try:
-                client.get(INDEX_URL, follow_redirects=True)
+                client.get(self.cfg.index_url, follow_redirects=True)
             except Exception:
                 pass
             ok, extra = self._probe_orders(client)
@@ -441,7 +433,7 @@ class CASLogin:
             timeout=self.timeout,
             follow_redirects=True,
             headers={
-                "User-Agent": USER_AGENT,
+                "User-Agent": self.cfg.user_agent,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             },
@@ -471,6 +463,7 @@ class CASLogin:
             )
             self._log("[CAS] [OK] 登录成功！")
             self._print_session_info(client)
+            client.booking_channel = self.channel
             return client
 
         except CASLoginError:
@@ -563,7 +556,7 @@ class CASLogin:
     def _verify_booking_session(self, client: httpx.Client) -> tuple[bool, str]:
         try:
             check_resp = client.get(
-                ORDERS_CHECK_URL,
+                self.cfg.orders_check_url,
                 params={"page": 1, "rows": 1, "sort": "createdate", "order": "desc"},
                 headers=AUTH_CHECK_HEADERS,
                 follow_redirects=False,
@@ -602,7 +595,7 @@ class CASLogin:
             return True
         try:
             check_resp = client.get(
-                USERINFO_URL,
+                self.cfg.userinfo_url,
                 follow_redirects=False,
             )
             if check_resp.status_code == 200 and "登录" not in check_resp.text[:200] and "登录失败" not in check_resp.text:
@@ -656,7 +649,7 @@ def create_authenticated_client(username: str, password: str, **kwargs) -> httpx
 
     Example:
         client = create_authenticated_client("username", "password")
-        resp = client.get(api_url("/product/findtime.html") + "?...")
+        resp = client.get(get_channel().api_url("/product/findtime.html") + "?...")
     """
     cas = CASLogin(**kwargs)
     return cas.login(username, password)
@@ -688,7 +681,8 @@ if __name__ == "__main__":
         print("=" * 60)
 
         # 测试1: 访问用户信息页
-        resp = client.get(USERINFO_URL, timeout=10)
+        cfg = get_channel(getattr(client, "booking_channel", None))
+        resp = client.get(cfg.userinfo_url, timeout=10)
         print(f"\n[测试] GET /yyuser/userinfo.html => {resp.status_code}")
         if "登录" in resp.text[:200]:
             print("  [FAIL] 未登录（session 无效）")
@@ -699,7 +693,7 @@ if __name__ == "__main__":
         from datetime import datetime, timedelta
         target_date = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
         venue_id = 103  # 二号巨构
-        url = api_url(f"/product/findtime.html?type=day&s_dates={target_date}&serviceid={venue_id}")
+        url = cfg.api_url(f"/product/findtime.html?type=day&s_dates={target_date}&serviceid={venue_id}")
         resp = client.get(url, headers={"X-Requested-With": "XMLHttpRequest"})
         print(f"\n[测试] GET /product/findtime.html (二号巨构, {target_date}) => {resp.status_code}")
         try:

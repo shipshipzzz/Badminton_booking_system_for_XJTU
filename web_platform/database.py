@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     schedule_mode   TEXT NOT NULL DEFAULT 'api',
     pre_query_delay INTEGER NOT NULL DEFAULT 1200,
     max_bookings    INTEGER NOT NULL DEFAULT 2,
+    booking_channel TEXT NOT NULL DEFAULT '8080',
     group_name      TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL DEFAULT 'idle',
     latest_booking_result TEXT NOT NULL DEFAULT '',
@@ -81,6 +82,10 @@ async def _migrate_profiles_table(db: aiosqlite.Connection):
     if "latest_booking_result_unread" not in columns:
         await db.execute(
             "ALTER TABLE profiles ADD COLUMN latest_booking_result_unread INTEGER NOT NULL DEFAULT 0"
+        )
+    if "booking_channel" not in columns:
+        await db.execute(
+            "ALTER TABLE profiles ADD COLUMN booking_channel TEXT NOT NULL DEFAULT '8080'"
         )
     await db.execute(
         """
@@ -155,6 +160,8 @@ def _row_to_dict(row, columns) -> dict:
                 d[key] = []
     d["schedule_enabled"] = bool(d.get("schedule_enabled", 0))
     d["latest_booking_result_unread"] = bool(d.get("latest_booking_result_unread", 0))
+    channel = str(d.get("booking_channel") or "8080").strip()
+    d["booking_channel"] = "80" if channel in ("80", "pc", "web", "desktop") else "8080"
     if "schedule_weekdays" not in d or d["schedule_weekdays"] is None:
         d["schedule_weekdays"] = list(DEFAULT_SCHEDULE_WEEKDAYS)
     return d
@@ -164,7 +171,7 @@ async def list_profiles() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
-            SELECT id, name, username, group_name, status,
+            SELECT id, name, username, group_name, status, booking_channel,
                    target_days, schedule_enabled, schedule_weekdays,
                    latest_booking_result, latest_booking_result_at, latest_booking_result_unread
             FROM profiles
@@ -217,7 +224,7 @@ async def clone_profile(profile_id: int, name: str | None = None) -> dict | None
             """
             SELECT name, username, password, target_days, venue_prefs, time_prefs,
                    schedule_weekdays, schedule_time, schedule_mode, pre_query_delay,
-                   max_bookings, group_name
+                   max_bookings, group_name, booking_channel
             FROM profiles
             WHERE id = ?
             """,
@@ -233,10 +240,10 @@ async def clone_profile(profile_id: int, name: str | None = None) -> dict | None
             INSERT INTO profiles (
                 name, username, password, target_days, venue_prefs, time_prefs,
                 schedule_enabled, schedule_weekdays, schedule_time, schedule_mode,
-                pre_query_delay, max_bookings, group_name, status,
+                pre_query_delay, max_bookings, group_name, booking_channel, status,
                 latest_booking_result, latest_booking_result_at, latest_booking_result_unread
             )
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'idle', '', NULL, 0)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'idle', '', NULL, 0)
             """,
             (
                 clone_name,
@@ -251,6 +258,7 @@ async def clone_profile(profile_id: int, name: str | None = None) -> dict | None
                 row[9],
                 row[10],
                 row[11],
+                row[12] if len(row) > 12 else "8080",
             ),
         )
         await db.commit()

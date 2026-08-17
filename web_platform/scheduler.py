@@ -278,7 +278,7 @@ async def _run_login_check(profile_id: int):
                 log_manager.emit(profile_id, f"[T-{LOGIN_LEAD_SECONDS}s] Session check failed: {e}, re-login...")
 
         for attempt in range(1, LOGIN_CHECK_MAX_ATTEMPTS + 1):
-            if booking_engine.do_login(profile_id, profile["username"], profile["password"]):
+            if booking_engine.do_login(profile_id, profile["username"], profile["password"], profile.get("booking_channel")):
                 if attempt > 1:
                     log_manager.emit(
                         profile_id,

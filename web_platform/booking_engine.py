@@ -40,7 +40,7 @@ from booking_api import (  # noqa: E402
 
 import httpx  # noqa: E402
 import log_manager  # noqa: E402
-from site_config import ORDERS_CHECK_URL, USER_AGENT  # noqa: E402
+from site_config import get_channel, normalize_channel  # noqa: E402
 
 VENUES = [
     {"id": 101, "name": "一号巨构", "totalCourts": 3},
@@ -87,6 +87,7 @@ class ProfileRuntime:
     session_ready: bool = False
     session_ready_reason: str = "not checked"
     session_ready_checked_at: float = 0.0
+    channel: str = "8080"
 
 
 def _format_booked_court_line(court: dict) -> str:
@@ -161,7 +162,7 @@ QUERY_MAX_WORKERS = 12
 DISPLAY_SCALE_RATIO = 260 / 590
 ANON_CLIENT_POOL_SIZE = QUERY_MAX_WORKERS + CAPTCHA_PREFETCH_MAX_WORKERS
 ANON_CLIENT_HEADERS = {
-    "User-Agent": USER_AGENT,
+    "User-Agent": get_channel().user_agent,
     "X-Requested-With": "XMLHttpRequest",
 }
 AUTH_CHECK_HEADERS = {
@@ -307,10 +308,28 @@ def match_slider_local(bg_base64: str, slider_base64: str) -> dict:
     }
 
 
-def fetch_and_match_captcha_anonymous() -> dict:
+def profile_channel(profile: dict | None = None, runtime: ProfileRuntime | None = None) -> str:
+    if profile and profile.get("booking_channel"):
+        return normalize_channel(profile.get("booking_channel"))
+    if runtime and runtime.channel:
+        return normalize_channel(runtime.channel)
+    return "8080"
+
+
+def drop_booking_session(rt: ProfileRuntime, reason: str = "session cleared"):
+    if rt.client:
+        try:
+            rt.client.close()
+        except Exception:
+            pass
+        rt.client = None
+    mark_session_ready(rt, False, reason)
+
+
+def fetch_and_match_captcha_anonymous(channel: str = "8080") -> dict:
     fetch_started = time.perf_counter()
     with lease_anonymous_client() as client:
-        captcha_id, bg, slider = fetch_captcha(client)
+        captcha_id, bg, slider = fetch_captcha(client, channel)
     fetch_ms = (time.perf_counter() - fetch_started) * 1000
 
     match_started = time.perf_counter()
@@ -327,14 +346,14 @@ def fetch_and_match_captcha_anonymous() -> dict:
     }
 
 
-def query_times_anonymous(venue_id: int, date: str) -> list:
+def query_times_anonymous(venue_id: int, date: str, channel: str = "8080") -> list:
     with lease_anonymous_client() as client:
-        return query_times(client, venue_id, date)
+        return query_times(client, venue_id, date, channel)
 
 
-def query_seats_anonymous(venue_id: int, stock_id: str, date: str = "") -> list:
+def query_seats_anonymous(venue_id: int, stock_id: str, date: str = "", channel: str = "8080") -> list:
     with lease_anonymous_client() as client:
-        return query_seats(client, venue_id, stock_id, date or None)
+        return query_seats(client, venue_id, stock_id, date or None, channel)
 
 
 def _has_booking_cookies(client: httpx.Client) -> bool:
@@ -347,17 +366,18 @@ def _has_booking_cookies(client: httpx.Client) -> bool:
     return False
 
 
-def verify_booking_session(client: httpx.Client | None) -> tuple[bool, str]:
+def verify_booking_session(client: httpx.Client | None, channel: str | None = None) -> tuple[bool, str]:
     if client is None:
         return False, "no client"
 
+    cfg = get_channel(channel or getattr(client, "booking_channel", None))
     cookie_snapshot = list(client.cookies.jar)
     last_reason = "no response"
     resp = None
     for attempt in range(4):
         try:
             resp = client.get(
-                ORDERS_CHECK_URL,
+                cfg.orders_check_url,
                 params={"page": 1, "rows": 1, "sort": "createdate", "order": "desc"},
                 headers=AUTH_CHECK_HEADERS,
                 timeout=8,
@@ -397,10 +417,11 @@ def verify_booking_session(client: httpx.Client | None) -> tuple[bool, str]:
 
 # ==================== Step 1: Login (T-60s) ====================
 
-def do_login(profile_id: int, username: str, password: str) -> bool:
+def do_login(profile_id: int, username: str, password: str, channel: str | None = None) -> bool:
     """Login and store authenticated client. Runs in thread."""
     log = lambda msg: log_manager.emit(profile_id, msg)
     rt = get_runtime(profile_id)
+    rt.channel = normalize_channel(channel or rt.channel)
 
     if rt.client:
         try:
@@ -410,11 +431,11 @@ def do_login(profile_id: int, username: str, password: str) -> bool:
         rt.client = None
     mark_session_ready(rt, False, "not logged in")
 
-    log("[Login] CAS login starting...")
+    log(f"[Login] CAS login starting on {get_channel(rt.channel).label}...")
     try:
-        cas = CASLogin(logger=log)
+        cas = CASLogin(logger=log, channel=rt.channel)
         client = cas.login(username, password)
-        session_valid, session_reason = verify_booking_session(client)
+        session_valid, session_reason = verify_booking_session(client, rt.channel)
         if not session_valid:
             transient = session_reason.startswith("status=5") or session_reason.startswith("request failed")
             if transient and _has_booking_cookies(client):
@@ -477,7 +498,7 @@ def do_prefetch_captchas(profile_id: int, count: int = 6) -> list:
             def submit_attempt():
                 nonlocal attempts
                 attempts += 1
-                futures[executor.submit(fetch_and_match_captcha_anonymous)] = attempts
+                futures[executor.submit(fetch_and_match_captcha_anonymous, rt.channel)] = attempts
 
             for _ in range(min(worker_count, max_attempts)):
                 submit_attempt()
@@ -524,6 +545,9 @@ def do_query_candidates(profile_id: int, profile: dict) -> dict:
     venue_prefs = [v for v in profile.get("venue_prefs", []) if v.get("enabled")]
     time_prefs = [t for t in profile.get("time_prefs", []) if t.get("enabled") and t.get("fanout", 0) > 0]
     date = get_target_booking_date(profile)
+    rt = get_runtime(profile_id)
+    channel = profile_channel(profile, rt)
+    rt.channel = channel
 
     if not venue_prefs or not time_prefs:
         return {}
@@ -536,7 +560,7 @@ def do_query_candidates(profile_id: int, profile: dict) -> dict:
     venue_workers = min(QUERY_MAX_WORKERS, len(venue_prefs))
     with ThreadPoolExecutor(max_workers=venue_workers) as executor:
         future_to_venue = {
-            executor.submit(query_times_anonymous, vp["id"], date): vp
+            executor.submit(query_times_anonymous, vp["id"], date, channel): vp
             for vp in venue_prefs
         }
         for future in future_to_venue:
@@ -560,7 +584,7 @@ def do_query_candidates(profile_id: int, profile: dict) -> dict:
         seat_workers = min(QUERY_MAX_WORKERS, len(seat_jobs))
         with ThreadPoolExecutor(max_workers=seat_workers) as executor:
             future_to_job = {
-                executor.submit(query_seats_anonymous, vp["id"], slot["ID"], date): (tp, vp, slot)
+                executor.submit(query_seats_anonymous, vp["id"], slot["ID"], date, channel): (tp, vp, slot)
                 for tp, vp, slot in seat_jobs
             }
             for future in future_to_job:
@@ -639,7 +663,7 @@ def do_book_court(profile_id: int, court: dict) -> dict:
         try:
             # Step A: Submit order page (writes to server session)
             log(f"{tag} -> order...")
-            submit_order(client, court["venueId"], court["stockId"], court["court"]["seatId"])
+            submit_order(client, court["venueId"], court["stockId"], court["court"]["seatId"], rt.channel)
 
             # Step B: Get captcha (use prefetched if available)
             precomputed = None
@@ -652,7 +676,7 @@ def do_book_court(profile_id: int, court: dict) -> dict:
                 log(f"{tag} <- pre-captcha (x={display_x})")
             else:
                 log(f"{tag} -> captcha...")
-                captcha = fetch_and_match_captcha_anonymous()
+                captcha = fetch_and_match_captcha_anonymous(rt.channel)
                 captcha_id = captcha["captcha_id"]
                 match_result = captcha["match"]
                 display_x = match_result["displayX"]
@@ -662,10 +686,10 @@ def do_book_court(profile_id: int, court: dict) -> dict:
                 )
 
             # Step C: Generate track + submit booking
-            yzm_data = generate_yzm_data(display_x, captcha_id)
+            yzm_data = generate_yzm_data(display_x, captcha_id, rt.channel)
             log(f"{tag} -> submit...")
             result = submit_booking(client, court["venueId"], court["stockId"],
-                                    court["court"]["seatId"], yzm_data)
+                                    court["court"]["seatId"], yzm_data, rt.channel)
 
             elapsed = (time.time() - t_start) * 1000
             success = result.get("result") == "1" or result.get("success")
@@ -842,6 +866,7 @@ def run_booking_flow(profile_id: int, profile: dict):
         rt.status = s
         log_manager.emit(profile_id, f"Status: {s}", status=s)
     rt = get_runtime(profile_id)
+    rt.channel = profile_channel(profile, rt)
     set_status("running")
     rt.cancel_event.clear()
 

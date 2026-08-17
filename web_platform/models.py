@@ -93,6 +93,7 @@ class ProfileUpdate(BaseModel):
     schedule_mode: Optional[str] = None
     pre_query_delay: Optional[int] = None
     max_bookings: Optional[int] = None
+    booking_channel: Optional[str] = None
 
 
 class ProfileResponse(BaseModel):
@@ -110,6 +111,7 @@ class ProfileResponse(BaseModel):
     schedule_mode: str
     pre_query_delay: int
     max_bookings: int
+    booking_channel: str = "8080"
     status: str
     next_schedule_at: Optional[str] = None
     latest_booking_result: str = ""
@@ -124,6 +126,7 @@ class ProfileSummary(BaseModel):
     name: str
     group_name: str = ""
     username: str
+    booking_channel: str = "8080"
     status: str
     next_schedule_at: Optional[str] = None
     latest_booking_result: str = ""

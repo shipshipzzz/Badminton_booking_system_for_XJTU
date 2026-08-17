@@ -16,6 +16,10 @@ body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background:#f0f2f
 .sidebar-item:hover { background:#e3f2fd; }
 .sidebar-item.active { background:#1e88e5; color:#fff; }
 .sidebar-item .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+.channel-tag { font-size:10px; padding:1px 6px; border-radius:8px; background:#e3f2fd; color:#1565c0; font-weight:700; flex-shrink:0; }
+.sidebar-item.active .channel-tag { background:rgba(255,255,255,.2); color:#fff; }
+.channel-tag.pc { background:#fff3e0; color:#ef6c00; }
+.sidebar-item.active .channel-tag.pc { background:rgba(255,255,255,.2); color:#ffe0b2; }
 .sidebar-group-title { padding:10px 18px 6px; font-size:11px; color:#78909c; font-weight:700; text-transform:uppercase; letter-spacing:.4px; }
 .sidebar-group .sidebar-item { padding-left:24px; }
 .main { flex:1; overflow-y:auto; padding:20px; }
@@ -174,6 +178,7 @@ input:focus, select:focus { border-color:#1e88e5; }
                @click="selectProfile(p.id)">
             <span class="dot" :style="{background: statusColor(p.status)}"></span>
             {{ p.name }}
+            <span class="channel-tag" :class="{pc: p.booking_channel==='80'}">{{ p.booking_channel==='80' ? '80' : '8080' }}</span>
           </div>
         </div>
       </div>
@@ -204,7 +209,7 @@ input:focus, select:focus { border-color:#1e88e5; }
                style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px">
             <div v-for="p in group.profiles" :key="p.id" class="dash-card" @click="selectProfile(p.id)">
             <div class="info">
-              <h3>{{ p.name }}</h3>
+              <h3>{{ p.name }} <span class="channel-tag" :class="{pc: p.booking_channel==='80'}">{{ p.booking_channel==='80' ? '电脑80' : '手机8080' }}</span></h3>
               <div class="user">{{ p.username || '(未配置账号)' }}</div>
               <div class="last-log" v-if="lastLogs[p.id]">{{ lastLogs[p.id] }}</div>
             </div>
@@ -298,6 +303,14 @@ input:focus, select:focus { border-color:#1e88e5; }
             <div class="form-row">
               <span class="form-label">最大预订数:</span>
               <input type="number" v-model.number="current.max_bookings" @change="saveProfile" min="1" max="5" style="width:60px">
+            </div>
+            <div class="form-row">
+              <span class="form-label">预订通道:</span>
+              <div class="chip" :class="{on: current.booking_channel!=='80'}" @click="setBookingChannel('8080')">手机8080</div>
+              <div class="chip" :class="{on: current.booking_channel==='80'}" @click="setBookingChannel('80')">电脑80</div>
+            </div>
+            <div style="font-size:12px;color:#666;margin-top:4px">
+              登录、查场、滑块、下单整条链路走所选通道。切换后需重新「测试登录」。同一账号开两个 profile 各走一条，只能对冲其中一条宕机，不会多抢一份库存。
             </div>
             <div style="font-size:12px;color:#666;margin-top:4px">
               开启后会自动排到下一个勾选的星期，无需每天手动点启用。
@@ -668,6 +681,7 @@ createApp({
       normalized.latest_booking_result_unread = !!normalized.latest_booking_result_unread
       if (!normalized.latest_booking_result_at) normalized.latest_booking_result_at = null
       if (!Array.isArray(normalized.target_days)) normalized.target_days = [2]
+      normalized.booking_channel = normalized.booking_channel === '80' ? '80' : '8080'
       if (Array.isArray(normalized.time_prefs)) {
         const toInt = (value, fallback) => {
           const n = Number(value)
@@ -941,6 +955,14 @@ createApp({
       clearTimeout(saveTimer)
       saveTimer = setTimeout(() => saveProfileNow(), 400)
     }
+    async function setBookingChannel(channel) {
+      if (!current.value || current.value.booking_channel === channel) return
+      current.value.booking_channel = channel
+      loginResult.value = null
+      courtData.value = null
+      orders.value = null
+      await saveProfileNow()
+    }
     async function saveProfileNow() {
       clearTimeout(saveTimer)
       if (!current.value || !currentId.value) return
@@ -1019,7 +1041,8 @@ createApp({
         for (const vp of enabledVenues) {
           const venueInfo = VENUES.find(x => x.id === vp.id)
           if (!venueInfo) continue
-          const data = await apiJson(`/api/venues/query?venue_id=${vp.id}&date=${dateInfo.dateStr}`)
+          const channel = current.value.booking_channel === '80' ? '80' : '8080'
+          const data = await apiJson(`/api/venues/query?venue_id=${vp.id}&date=${dateInfo.dateStr}&channel=${channel}`)
           if (!data || !data.length) continue
           const slots = data.map(slot => {
             const seatMap = {}
@@ -1321,7 +1344,7 @@ createApp({
       loginTesting, loginResult, cloning, countdown, logConsole, currentStatus,
       querying, courtData, queryDate,
       statusColor, statusLabel, dayLabel, weekdayLabel, allCourts,
-      loadProfiles, selectProfile, addProfile, deleteProfile, cloneProfile, saveProfile,
+      loadProfiles, selectProfile, addProfile, deleteProfile, cloneProfile, saveProfile, setBookingChannel,
       testLogin, startScheduled, startImmediate, stopBooking,
       queryCourtStatus, bookCourt,
       toggleDay, toggleScheduleWeekday, toggleCourt, cyclePriority, clearLogs,

@@ -399,6 +399,16 @@ async def update_profile(profile_id: int, body: ProfileUpdate, request: Request)
         updates["venue_prefs"] = [v.model_dump() if hasattr(v, "model_dump") else v for v in updates["venue_prefs"]]
     if "time_prefs" in updates:
         updates["time_prefs"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in updates["time_prefs"]]
+    if "booking_channel" in updates:
+        from site_config import normalize_channel
+        updates["booking_channel"] = normalize_channel(updates["booking_channel"])
+        if normalize_channel(existing.get("booking_channel")) != updates["booking_channel"]:
+            booking_engine.drop_booking_session(
+                booking_engine.get_runtime(profile_id),
+                f"channel switched to {updates['booking_channel']}",
+            )
+            booking_engine.get_runtime(profile_id).channel = updates["booking_channel"]
+            log_manager.emit(profile_id, f"[Channel] Switched to {updates['booking_channel']}, session cleared")
     # Regular users cannot change username/password
     if not user["is_admin"]:
         updates.pop("username", None)
@@ -455,7 +465,7 @@ async def test_login(profile_id: int, request: Request):
     if not profile["username"] or not profile["password"]:
         raise HTTPException(400, "Username and password required")
     success = await asyncio.to_thread(
-        booking_engine.do_login, profile_id, profile["username"], profile["password"]
+        booking_engine.do_login, profile_id, profile["username"], profile["password"], profile.get("booking_channel")
     )
     return {"success": success}
 
@@ -528,7 +538,7 @@ async def book_single_court(profile_id: int, body: BookCourtRequest, request: Re
     if not rt.client:
         log_manager.emit(profile_id, "Logging in for single court booking...")
         success = await asyncio.to_thread(
-            booking_engine.do_login, profile_id, profile["username"], profile["password"])
+            booking_engine.do_login, profile_id, profile["username"], profile["password"], profile.get("booking_channel"))
         if not success:
             raise HTTPException(500, "Login failed")
     court = {
@@ -635,7 +645,7 @@ async def _ensure_profile_booking_session(profile_id: int, profile: dict, *,
 
     log_manager.emit(profile_id, f"{log_prefix} Session missing/invalid ({session_reason}), auto-login...")
     success = await asyncio.to_thread(
-        booking_engine.do_login, profile_id, profile["username"], profile["password"]
+        booking_engine.do_login, profile_id, profile["username"], profile["password"], profile.get("booking_channel")
     )
     if not success:
         raise HTTPException(500, "Auto login failed")
@@ -645,11 +655,12 @@ async def _ensure_profile_booking_session(profile_id: int, profile: dict, *,
 
 
 def _fetch_orders_once(client):
-    from site_config import ORDERS_CHECK_URL, ORDERS_DETAIL_URL
+    from site_config import get_channel
+    cfg = get_channel(getattr(client, "booking_channel", None))
     headers = {"X-Requested-With": "XMLHttpRequest"}
     status_map = {1: "完成", 2: "已取消", 3: "待支付"}
     resp = client.get(
-        ORDERS_CHECK_URL,
+        cfg.orders_check_url,
         params={"page": 1, "rows": 20, "sort": "createdate", "order": "desc"},
         headers=headers,
         timeout=10,
@@ -684,7 +695,7 @@ def _fetch_orders_once(client):
         }
         try:
             dr = client.get(
-                ORDERS_DETAIL_URL,
+                cfg.orders_detail_url,
                 params={"orderid": order_id, "page": 1, "rows": 1},
                 headers=headers,
                 timeout=5,
@@ -734,22 +745,25 @@ async def get_my_orders(profile_id: int, request: Request):
 # ==================== Venue Query (stateless, no auth needed) ====================
 
 @app.get("/api/venues/query")
-async def query_venues(venue_id: int, date: str):
+async def query_venues(venue_id: int, date: str, channel: str = "8080"):
     import sys as _sys
     _cas_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cas_http")
     if _cas_path not in _sys.path:
         _sys.path.insert(0, _cas_path)
     import httpx
     from booking_api import query_times as _qt, query_seats as _qs
-    from site_config import USER_AGENT as _BOOKING_UA
+    from site_config import get_channel as _get_channel
+
+    cfg = _get_channel(channel)
 
     def _query():
-        client = httpx.Client(timeout=10, headers={"User-Agent": _BOOKING_UA})
+        client = httpx.Client(timeout=10, headers={"User-Agent": cfg.user_agent})
+        client.booking_channel = cfg.id
         try:
-            times = _qt(client, venue_id, date)
+            times = _qt(client, venue_id, date, cfg.id)
             result = []
             for t in times:
-                seats = _qs(client, venue_id, t["ID"], date)
+                seats = _qs(client, venue_id, t["ID"], date, cfg.id)
                 result.append({
                     "time": t["TIME_NO"],
                     "stockId": t["ID"],
