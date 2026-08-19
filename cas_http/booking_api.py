@@ -280,14 +280,61 @@ def generate_yzm_data(target_x, captcha_id, channel=None):
     return json.dumps(yzm_data) + "synjones" + captcha_id + "synjones" + get_channel(channel).yzm_origin
 
 
-def submit_order(client, venue_id, stock_id, seat_id, channel=None):
-    cfg = _cfg(channel, client)
+MAX_ORDER_ITEMS = 2
+
+
+def _as_order_items(stock_id=None, seat_id=None, items=None):
+    if items:
+        normalized = []
+        for item in items:
+            normalized.append({
+                "stock_id": item["stock_id"],
+                "seat_id": item["seat_id"],
+            })
+        return normalized[:MAX_ORDER_ITEMS]
+    if stock_id is None or seat_id is None:
+        raise ValueError("stock_id/seat_id or items required")
+    return [{"stock_id": stock_id, "seat_id": seat_id}]
+
+
+def _order_param(venue_id, items, for_booking=False):
+    """Build official order JSON. One POST can carry 1-2 courts."""
+    if not items:
+        raise ValueError("order items required")
+    stock = {}
+    stockdetail = {}
+    seat_ids = []
+    for item in items[:MAX_ORDER_ITEMS]:
+        stock_id = str(item["stock_id"])
+        seat_id = item["seat_id"]
+        stock[stock_id] = str(int(stock.get(stock_id, 0)) + 1)
+        stockdetail[stock_id] = seat_id
+        seat_ids.append(seat_id)
     param = {
-        "stock": {str(stock_id): "1"},
+        "stock": stock,
         "address": str(venue_id),
-        "stockdetailids": seat_id,
+        "stockdetailids": ",".join(str(seat_id) for seat_id in seat_ids),
         "extend": {},
     }
+    if for_booking:
+        param.update({
+            "activityPrice": 0,
+            "flag": "0",
+            "isbookall": "0",
+            "isfreeman": "0",
+            "istimes": "0",
+            "shoppingcart": "0",
+            "subscriber": "0",
+            "stockdetail": stockdetail,
+            "venueReason": "",
+            "fileUrl": "",
+        })
+    return param
+
+
+def submit_order(client, venue_id, stock_id=None, seat_id=None, channel=None, items=None):
+    cfg = _cfg(channel, client)
+    param = _order_param(venue_id, _as_order_items(stock_id, seat_id, items), for_booking=False)
     data = urlencode({"param": json.dumps(param)})
     resp = client.post(
         cfg.api_url(f"/order/show.html?id={venue_id}"),
@@ -302,24 +349,11 @@ def submit_order(client, venue_id, stock_id, seat_id, channel=None):
     return resp.status_code, resp.text[:200]
 
 
-def submit_booking(client, venue_id, stock_id, seat_id, yzm_data, channel=None):
+def submit_booking(client, venue_id, stock_id=None, seat_id=None, yzm_data=None, channel=None, items=None):
+    if yzm_data is None:
+        raise ValueError("yzm_data required")
     cfg = _cfg(channel, client)
-    param = {
-        "activityPrice": 0,
-        "address": str(venue_id),
-        "extend": {},
-        "flag": "0",
-        "isbookall": "0",
-        "isfreeman": "0",
-        "istimes": "0",
-        "shoppingcart": "0",
-        "subscriber": "0",
-        "stock": {str(stock_id): "1"},
-        "stockdetail": {str(stock_id): str(seat_id)},
-        "stockdetailids": str(seat_id),
-        "venueReason": "",
-        "fileUrl": "",
-    }
+    param = _order_param(venue_id, _as_order_items(stock_id, seat_id, items), for_booking=True)
     body = f"param={httpx.URL('?' + urlencode({'p': json.dumps(param)})).params['p']}&yzm={httpx.URL('?' + urlencode({'y': yzm_data})).params['y']}&json=true"
     resp = client.post(
         cfg.api_url(cfg.book_path),

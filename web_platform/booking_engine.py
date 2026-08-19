@@ -41,6 +41,15 @@ from booking_api import (  # noqa: E402
 import httpx  # noqa: E402
 import log_manager  # noqa: E402
 from site_config import get_channel, normalize_channel  # noqa: E402
+from dual_slot import (  # noqa: E402
+    collect_priority_levels,
+    collect_query_slot_times,
+    dual_occupied_times,
+    filter_single_time_prefs,
+    get_dual_slot_prefs,
+    pick_dual_pairs,
+    tasks_for_wave,
+)
 
 VENUES = [
     {"id": 101, "name": "一号巨构", "totalCourts": 3},
@@ -83,6 +92,7 @@ class ProfileRuntime:
     prefetched_captchas: list = field(default_factory=list)  # Pre-fetched captchas
     captcha_lock: threading.Lock = field(default_factory=threading.Lock)
     prefetch_lock: threading.Lock = field(default_factory=threading.Lock)
+    book_lock: threading.Lock = field(default_factory=threading.Lock)
     continuous_query_running: bool = False
     session_ready: bool = False
     session_ready_reason: str = "not checked"
@@ -543,16 +553,16 @@ def do_query_candidates(profile_id: int, profile: dict) -> dict:
     log = lambda msg: log_manager.emit(profile_id, msg)
 
     venue_prefs = [v for v in profile.get("venue_prefs", []) if v.get("enabled")]
-    time_prefs = [t for t in profile.get("time_prefs", []) if t.get("enabled") and t.get("fanout", 0) > 0]
+    slot_times = collect_query_slot_times(profile)
     date = get_target_booking_date(profile)
     rt = get_runtime(profile_id)
     channel = profile_channel(profile, rt)
     rt.channel = channel
 
-    if not venue_prefs or not time_prefs:
+    if not venue_prefs or not slot_times:
         return {}
 
-    results = {tp["time"]: [] for tp in time_prefs}
+    results = {time_str: [] for time_str in slot_times}
     total_started = time.perf_counter()
 
     stage1_started = time.perf_counter()
@@ -572,23 +582,23 @@ def do_query_candidates(profile_id: int, profile: dict) -> dict:
                 log(f"[Query] {vp['name']} times failed: {e}")
 
     seat_jobs = []
-    for tp in time_prefs:
+    for time_str in slot_times:
         for vp in venue_prefs:
             times = venue_times_map.get(vp["id"], [])
-            slot = _find_matching_slot(times, tp["time"])
+            slot = _find_matching_slot(times, time_str)
             if slot:
-                seat_jobs.append((tp, vp, slot))
+                seat_jobs.append((time_str, vp, slot))
 
     stage2_started = time.perf_counter()
     if seat_jobs:
         seat_workers = min(QUERY_MAX_WORKERS, len(seat_jobs))
         with ThreadPoolExecutor(max_workers=seat_workers) as executor:
             future_to_job = {
-                executor.submit(query_seats_anonymous, vp["id"], slot["ID"], date, channel): (tp, vp, slot)
-                for tp, vp, slot in seat_jobs
+                executor.submit(query_seats_anonymous, vp["id"], slot["ID"], date, channel): (time_str, vp, slot)
+                for time_str, vp, slot in seat_jobs
             }
             for future in future_to_job:
-                tp, vp, slot = future_to_job[future]
+                time_str, vp, slot = future_to_job[future]
                 try:
                     seats = future.result()
                 except Exception as e:
@@ -603,11 +613,11 @@ def do_query_candidates(profile_id: int, profile: dict) -> dict:
                     if allowed and seat["courtNumber"] not in allowed:
                         continue
                     pri = court_priority.get(str(seat["courtNumber"]), seat["courtNumber"])
-                    results[tp["time"]].append({
+                    results[time_str].append({
                         "venueId": vp["id"],
                         "venueName": vp["name"],
                         "date": date,
-                        "timeSlot": slot.get("TIME_NO", tp["time"]),
+                        "timeSlot": slot.get("TIME_NO", time_str),
                         "stockId": slot["ID"],
                         "court": {
                             "courtNumber": seat["courtNumber"],
@@ -644,15 +654,30 @@ def do_query_candidates(profile_id: int, profile: dict) -> dict:
 SLIDER_MAX_RETRIES = 2
 
 
-def do_book_court(profile_id: int, court: dict) -> dict:
+def do_book_court(profile_id: int, court: dict, shared: dict | None = None) -> dict:
+    return do_book_courts(profile_id, [court], shared=shared)
+
+
+def do_book_courts(profile_id: int, courts: list[dict], shared: dict | None = None) -> dict:
     """
-    Book a single court. Only retries on captcha errors.
-    Business errors (same_slot_booked, daily_limit) return immediately.
+    Book 1-2 courts in one order. One captcha, one show.html, one book.html.
+    Only retries on captcha / retryable errors.
     """
     log = lambda msg: log_manager.emit(profile_id, msg)
     rt = get_runtime(profile_id)
     client = rt.client
-    tag = f"[{court['timeSlot']}][{court['court']['courtName']}]"
+    if not client:
+        return {"success": False, "message": "No session"}
+    if not courts:
+        return {"success": False, "message": "No courts"}
+
+    venue_ids = {court["venueId"] for court in courts}
+    if len(venue_ids) != 1:
+        return {"success": False, "message": "Must be same venue"}
+
+    venue_id = courts[0]["venueId"]
+    items = [{"stock_id": court["stockId"], "seat_id": court["court"]["seatId"]} for court in courts]
+    tag = "+".join(f"[{court['timeSlot']}][{court['court']['courtName']}]" for court in courts)
     use_precomputed = True
 
     for attempt in range(1, SLIDER_MAX_RETRIES + 1):
@@ -661,11 +686,6 @@ def do_book_court(profile_id: int, court: dict) -> dict:
 
         t_start = time.time()
         try:
-            # Step A: Submit order page (writes to server session)
-            log(f"{tag} -> order...")
-            submit_order(client, court["venueId"], court["stockId"], court["court"]["seatId"], rt.channel)
-
-            # Step B: Get captcha (use prefetched if available)
             precomputed = None
             if use_precomputed:
                 precomputed = pop_valid_prefetched_captcha(rt)
@@ -685,11 +705,18 @@ def do_book_court(profile_id: int, court: dict) -> dict:
                     f"(fetch:{captcha['fetch_ms']:.0f}ms match:{captcha['match_ms']:.0f}ms)"
                 )
 
-            # Step C: Generate track + submit booking
             yzm_data = generate_yzm_data(display_x, captcha_id, rt.channel)
-            log(f"{tag} -> submit...")
-            result = submit_booking(client, court["venueId"], court["stockId"],
-                                    court["court"]["seatId"], yzm_data, rt.channel)
+            with rt.book_lock:
+                if shared:
+                    with shared["lock"]:
+                        if shared["successful"] >= shared["max_bookings"] or shared["daily_limit_reached"]:
+                            return {"success": False, "message": "Quota reached"}
+                if rt.cancel_event.is_set():
+                    return {"success": False, "message": "Cancelled"}
+                log(f"{tag} -> order...")
+                submit_order(client, venue_id, channel=rt.channel, items=items)
+                log(f"{tag} -> submit...")
+                result = submit_booking(client, venue_id, yzm_data=yzm_data, channel=rt.channel, items=items)
 
             elapsed = (time.time() - t_start) * 1000
             success = result.get("result") == "1" or result.get("success")
@@ -697,26 +724,20 @@ def do_book_court(profile_id: int, court: dict) -> dict:
 
             if success:
                 log(f"{tag} BOOKED! ({elapsed:.0f}ms) {msg}")
-                return {"success": True, "message": msg, "elapsed": elapsed}
+                return {"success": True, "message": msg, "elapsed": elapsed, "courts": courts}
 
             log(f"{tag} Failed: {msg} ({elapsed:.0f}ms)")
 
-            # --- Error classification & retry logic ---
-
-            # 1. Daily limit: stop everything immediately
             if is_daily_limit_error(msg):
                 return {"success": False, "message": msg, "daily_limit": True}
 
-            # 2. Same slot booked: stop this slot immediately
             if is_same_slot_booked_error(msg):
                 return {"success": False, "message": msg, "same_slot_booked": True}
 
-            # 3. No seat (grabbed by others): skip this court, no retry
             if is_no_seat_error(msg):
                 log(f"{tag} Court taken, skip")
                 return {"success": False, "message": msg}
 
-            # 4. Captcha error: retry with realtime captcha
             if is_captcha_error(msg):
                 if precomputed:
                     log(f"{tag} Pre-captcha invalid, switching to realtime...")
@@ -725,21 +746,18 @@ def do_book_court(profile_id: int, court: dict) -> dict:
                     continue
                 return {"success": False, "message": msg}
 
-            # 5. Retryable (network error / data error / time window not open): retry once
             if is_retryable_error(msg):
                 if attempt < SLIDER_MAX_RETRIES:
                     log(f"{tag} Retryable error, retrying...")
-                    time.sleep(0.5)  # Brief pause before retry
+                    time.sleep(0.5)
                     continue
                 return {"success": False, "message": msg}
 
-            # 6. Unknown error: don't retry, let caller try next court
             return {"success": False, "message": msg}
 
         except Exception as e:
             elapsed = (time.time() - t_start) * 1000
             log(f"{tag} Error: {e} ({elapsed:.0f}ms)")
-            # Network/timeout exceptions are retryable
             if attempt < SLIDER_MAX_RETRIES:
                 log(f"{tag} Retrying...")
                 continue
@@ -802,7 +820,7 @@ def _book_time_slot(profile_id: int, time_slot: str, fanout: int,
                 return {"success": False}
 
             log(f"[{time_slot}] Try #{attempt_no}/{fanout}: {court['venueName']} {court['court']['courtName']}")
-            result = do_book_court(profile_id, court)
+            result = do_book_court(profile_id, court, shared=shared)
 
             if result["success"]:
                 with slot_lock:
@@ -849,6 +867,133 @@ def _book_time_slot(profile_id: int, time_slot: str, fanout: int,
     return {"success": False}
 
 
+def _book_dual_slot(profile_id: int, dual_pref: dict, shared: dict) -> dict:
+    """Book one dual-slot pair (same court number across two consecutive slots)."""
+    log = lambda msg: log_manager.emit(profile_id, msg)
+    rt = get_runtime(profile_id)
+    start_time = dual_pref["time"]
+    next_time = dual_pref["next_time"]
+    fanout = dual_pref.get("fanout", 4)
+    parallel = dual_pref.get("parallel", 1)
+    max_parallel = max(1, min(int(parallel or 1), fanout or 1))
+    label = f"{start_time}+{next_time}"
+    tried_courts = set()
+    slot_state = {
+        "tried": 0,
+        "success": False,
+        "same_slot_booked": False,
+    }
+    slot_lock = threading.Lock()
+
+    if max_parallel > 1:
+        log(f"[Dual {label}] Slot parallel={max_parallel}, fanout={fanout}")
+
+    def _take_next_pair():
+        with slot_lock:
+            if slot_state["success"] or slot_state["same_slot_booked"] or slot_state["tried"] >= fanout:
+                return None, None
+            pairs = pick_dual_pairs(
+                rt.cached_candidates.get(start_time, []),
+                rt.cached_candidates.get(next_time, []),
+            )
+            for first, second in pairs:
+                court_key = f"{first['venueId']}_{first['court']['courtNumber']}"
+                if court_key in tried_courts:
+                    continue
+                tried_courts.add(court_key)
+                slot_state["tried"] += 1
+                return slot_state["tried"], (first, second)
+        return None, None
+
+    def _worker():
+        while True:
+            with shared["lock"]:
+                if shared["successful"] >= shared["max_bookings"]:
+                    return {"success": False}
+                if shared["daily_limit_reached"]:
+                    return {"success": False, "daily_limit": True}
+            if rt.cancel_event.is_set():
+                return {"success": False}
+
+            attempt_no, pair = _take_next_pair()
+            if not pair:
+                return {"success": False}
+
+            first, second = pair
+            log(
+                f"[Dual {label}] Try #{attempt_no}/{fanout}: "
+                f"{first['venueName']} {first['court']['courtName']}"
+            )
+            result = do_book_courts(profile_id, [first, second], shared=shared)
+
+            if result["success"]:
+                with slot_lock:
+                    if slot_state["success"]:
+                        return {"success": False}
+                    slot_state["success"] = True
+                with shared["lock"]:
+                    shared["successful"] += 2
+                    shared["booked_courts"].extend([first, second])
+                    count = shared["successful"]
+                log(f"[Dual {label}] Booked! ({count}/{shared['max_bookings']})")
+                return {"success": True, "courts": [first, second], "dual": True}
+
+            msg = result.get("message", "")
+
+            if result.get("daily_limit") or is_daily_limit_error(msg):
+                with shared["lock"]:
+                    shared["daily_limit_reached"] = True
+                log(f"[Dual {label}] Daily limit reached, stopping all")
+                return {"success": False, "daily_limit": True}
+
+            if result.get("same_slot_booked") or is_same_slot_booked_error(msg):
+                with slot_lock:
+                    slot_state["same_slot_booked"] = True
+                log(f"[Dual {label}] Same slot already booked, skip this pair")
+                return {"success": False, "same_slot_booked": True}
+
+            log(f"[Dual {label}] Failed: {msg}, trying next court...")
+
+    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+        futures = [executor.submit(_worker) for _ in range(max_parallel)]
+        results = [future.result() for future in futures]
+
+    if any(r.get("success") for r in results):
+        for r in results:
+            if r.get("success"):
+                return r
+    if any(r.get("daily_limit") for r in results):
+        return {"success": False, "daily_limit": True}
+    if any(r.get("same_slot_booked") for r in results):
+        return {"success": False, "same_slot_booked": True}
+    if slot_state["tried"] >= fanout or tried_courts:
+        log(f"[Dual {label}] No more candidates")
+    else:
+        log(f"[Dual {label}] No same-court pair available in both slots")
+    return {"success": False}
+
+
+def _run_priority_wave(profile_id: int, duals: list[dict], singles: list[dict], shared: dict) -> list[dict]:
+    tasks = [("dual", item) for item in duals] + [("single", item) for item in singles]
+    if not tasks:
+        return []
+    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+        futures = []
+        for kind, item in tasks:
+            if kind == "dual":
+                futures.append(executor.submit(_book_dual_slot, profile_id, item, shared))
+            else:
+                futures.append(executor.submit(
+                    _book_time_slot,
+                    profile_id,
+                    item["time"],
+                    item.get("fanout", 4),
+                    item.get("parallel", 1),
+                    shared,
+                ))
+        return [future.result() for future in futures]
+
+
 # ==================== Full Booking Flow ====================
 
 def run_booking_flow(profile_id: int, profile: dict):
@@ -870,7 +1015,9 @@ def run_booking_flow(profile_id: int, profile: dict):
     set_status("running")
     rt.cancel_event.clear()
 
-    time_prefs = [t for t in profile.get("time_prefs", []) if t.get("enabled") and t.get("fanout", 0) > 0]
+    dual_prefs = get_dual_slot_prefs(profile)
+    occupied_times = dual_occupied_times(dual_prefs)
+    single_prefs = filter_single_time_prefs(profile.get("time_prefs", []), occupied_times)
     max_bookings = profile.get("max_bookings", 2)
 
     shared = {
@@ -936,7 +1083,7 @@ def run_booking_flow(profile_id: int, profile: dict):
 
         if rt.cancel_event.is_set():
             set_status("idle")
-            return
+            return build_booking_flow_result(profile, persist=False)
 
         # Wait for booking time window (08:40-21:40) if needed
         now_dt = datetime.now()
@@ -955,53 +1102,43 @@ def run_booking_flow(profile_id: int, profile: dict):
         log("--- Start booking ---")
         t_start = time.time()
 
-        # Group time slots by priority
-        priority_groups = {}
-        for tp in time_prefs:
-            pri = tp.get("priority", 1)
-            priority_groups.setdefault(pri, []).append(tp)
-        sorted_priorities = sorted(priority_groups.keys())
+        if dual_prefs:
+            log("Dual slots: " + ", ".join(
+                f"P{item['priority']}({item['time']}+{item['next_time']})"
+                for item in dual_prefs
+            ))
+            if occupied_times:
+                log("Single-slot road excludes: " + ", ".join(sorted(occupied_times)))
+        if single_prefs:
+            log("Single slots: " + ", ".join(
+                f"P{item.get('priority', 1)}({item['time']})"
+                for item in single_prefs
+            ))
 
-        log(f"Priority groups: " + " -> ".join(
-            f"P{p}({','.join(t['time'] for t in priority_groups[p])})"
-            for p in sorted_priorities))
+        sorted_priorities = collect_priority_levels(dual_prefs, single_prefs)
+        log("Priority waves: " + " -> ".join(f"P{pri}" for pri in sorted_priorities))
 
+        dual_road_succeeded = False
         for pri in sorted_priorities:
             if shared["successful"] >= max_bookings or shared["daily_limit_reached"]:
                 break
             if rt.cancel_event.is_set():
                 break
 
-            group = priority_groups[pri]
-            log(f"--- Priority {pri}: {', '.join(t['time'] for t in group)} ---")
+            duals, singles = tasks_for_wave(pri, dual_prefs, single_prefs, dual_road_succeeded)
+            if not duals and not singles:
+                continue
 
-            if len(group) == 1:
-                tp = group[0]
-                _book_time_slot(
-                    profile_id,
-                    tp["time"],
-                    tp.get("fanout", 4),
-                    tp.get("parallel", 1),
-                    shared,
-                )
-            else:
-                # Same priority = concurrent execution (matches Promise.all)
-                with ThreadPoolExecutor(max_workers=len(group)) as executor:
-                    futures = []
-                    for tp in group:
-                        f = executor.submit(
-                            _book_time_slot,
-                            profile_id,
-                            tp["time"],
-                            tp.get("fanout", 4),
-                            tp.get("parallel", 1),
-                            shared,
-                        )
-                        futures.append(f)
-                    results = [f.result() for f in futures]
-                    if any(r.get("daily_limit") for r in results):
-                        shared["daily_limit_reached"] = True
-                        break
+            dual_label = ", ".join(f"{item['time']}+{item['next_time']}" for item in duals) or "-"
+            single_label = ", ".join(item["time"] for item in singles) or "-"
+            log(f"--- Wave P{pri}: dual={dual_label} | single={single_label} ---")
+
+            results = _run_priority_wave(profile_id, duals, singles, shared)
+            if any(r.get("success") and r.get("dual") for r in results):
+                dual_road_succeeded = True
+            if any(r.get("daily_limit") for r in results):
+                shared["daily_limit_reached"] = True
+                break
 
         # Stop continuous query
         rt.continuous_query_running = False

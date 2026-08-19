@@ -399,6 +399,10 @@ async def update_profile(profile_id: int, body: ProfileUpdate, request: Request)
         updates["venue_prefs"] = [v.model_dump() if hasattr(v, "model_dump") else v for v in updates["venue_prefs"]]
     if "time_prefs" in updates:
         updates["time_prefs"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in updates["time_prefs"]]
+    if "dual_slot_prefs" in updates:
+        updates["dual_slot_prefs"] = [
+            t.model_dump() if hasattr(t, "model_dump") else t for t in updates["dual_slot_prefs"]
+        ]
     if "booking_channel" in updates:
         from site_config import normalize_channel
         updates["booking_channel"] = normalize_channel(updates["booking_channel"])
@@ -654,6 +658,36 @@ async def _ensure_profile_booking_session(profile_id: int, profile: dict, *,
 
 
 
+def _unique_join(values) -> str:
+    seen: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.append(text)
+    return "\n".join(seen)
+
+
+def _summarize_order_detail_rows(rows: list) -> dict:
+    items = []
+    for row in rows or []:
+        stock = row.get("stock") or {}
+        detail = row.get("stockdetail") or {}
+        items.append({
+            "date": str(stock.get("s_date") or "").strip(),
+            "timeSlot": str(stock.get("time_no") or "").strip(),
+            "court": str(detail.get("sname") or "").strip(),
+        })
+    items.sort(key=lambda item: item["timeSlot"])
+    courts = [item["court"] for item in items if item["court"]]
+    unique_courts = _unique_join(courts)
+    return {
+        "date": _unique_join(item["date"] for item in items),
+        "timeSlot": "\n".join(item["timeSlot"] for item in items if item["timeSlot"]),
+        "court": unique_courts if "\n" not in unique_courts else "\n".join(courts),
+        "items": items,
+    }
+
+
 def _fetch_orders_once(client):
     from site_config import get_channel
     cfg = get_channel(getattr(client, "booking_channel", None))
@@ -692,22 +726,19 @@ def _fetch_orders_once(client):
             "date": "",
             "timeSlot": "",
             "court": "",
+            "items": [],
         }
         try:
             dr = client.get(
                 cfg.orders_detail_url,
-                params={"orderid": order_id, "page": 1, "rows": 1},
+                params={"orderid": order_id, "page": 1, "rows": 10},
                 headers=headers,
                 timeout=5,
                 follow_redirects=False,
             )
             if dr.status_code == 200:
                 dd = dr.json()
-                if dd.get("rows"):
-                    r0 = dd["rows"][0]
-                    order["date"] = (r0.get("stock") or {}).get("s_date", "")
-                    order["timeSlot"] = (r0.get("stock") or {}).get("time_no", "")
-                    order["court"] = (r0.get("stockdetail") or {}).get("sname", "")
+                order.update(_summarize_order_detail_rows(dd.get("rows") or []))
         except Exception:
             pass
         orders.append(order)

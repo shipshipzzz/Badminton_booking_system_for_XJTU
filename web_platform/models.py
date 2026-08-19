@@ -23,6 +23,11 @@ class TimePreference(BaseModel):
     priority: int = Field(default=1, ge=1, le=5)
 
 
+class DualSlotPreference(BaseModel):
+    time: str
+    priority: int = Field(default=1, ge=1, le=5)
+
+
 # ==================== Profile CRUD ====================
 
 VENUES = [
@@ -46,22 +51,24 @@ def default_venue_prefs() -> list[dict]:
     ]
 
 
+TIME_SLOT_LABELS = [
+    "08:00-09:00",
+    "09:01-10:00",
+    "10:01-11:00",
+    "11:01-12:00",
+    "14:30-15:30",
+    "15:31-16:30",
+    "16:31-17:30",
+    "17:31-18:30",
+    "18:31-19:30",
+    "19:31-20:30",
+    "20:31-21:30",
+]
+
+
 def default_time_prefs() -> list[dict]:
     slots = []
-    time_slots = [
-        "08:00-09:00",
-        "09:01-10:00",
-        "10:01-11:00",
-        "11:01-12:00",
-        "14:30-15:30",
-        "15:31-16:30",
-        "16:31-17:30",
-        "17:31-18:30",
-        "18:31-19:30",
-        "19:31-20:30",
-        "20:31-21:30",
-    ]
-    for i, time_str in enumerate(time_slots):
+    for i, time_str in enumerate(TIME_SLOT_LABELS):
         slots.append({
             "time": time_str,
             "enabled": i < 2,
@@ -87,6 +94,8 @@ class ProfileUpdate(BaseModel):
     target_days: Optional[list[int]] = None
     venue_prefs: Optional[list[VenuePreference]] = None
     time_prefs: Optional[list[TimePreference]] = None
+    dual_slot_enabled: Optional[bool] = None
+    dual_slot_prefs: Optional[list[DualSlotPreference]] = None
     schedule_enabled: Optional[bool] = None
     schedule_weekdays: Optional[list[int]] = None
     schedule_time: Optional[str] = None
@@ -105,6 +114,8 @@ class ProfileResponse(BaseModel):
     target_days: list[int]
     venue_prefs: list[dict]
     time_prefs: list[dict]
+    dual_slot_enabled: bool = False
+    dual_slot_prefs: list[dict] = Field(default_factory=list)
     schedule_enabled: bool
     schedule_weekdays: list[int]
     schedule_time: str

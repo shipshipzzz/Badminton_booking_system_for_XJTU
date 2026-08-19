@@ -384,8 +384,8 @@ input:focus, select:focus { border-color:#1e88e5; }
                 <tr v-for="o in orders" :key="o.orderId">
                   <td>{{ o.venue }}</td>
                   <td>{{ o.date }}</td>
-                  <td style="font-weight:600">{{ o.timeSlot }}</td>
-                  <td style="font-weight:600">{{ o.court }}</td>
+                  <td style="font-weight:600;white-space:pre-line">{{ o.timeSlot }}</td>
+                  <td style="font-weight:600;white-space:pre-line">{{ o.court }}</td>
                   <td style="font-size:11px;color:#666">{{ o.createTime }}</td>
                   <td :style="{color: o.status==='完成' ? '#4caf50' : o.status==='已取消' ? '#999' : '#ff9800', fontWeight:700}">
                     {{ o.status }}
@@ -459,6 +459,28 @@ input:focus, select:focus { border-color:#1e88e5; }
             </div>
           </div>
 
+          <!-- Dual Slot -->
+          <div class="card">
+            <div class="card-title">双时段</div>
+            <div class="form-row">
+              <label><input type="checkbox" v-model="current.dual_slot_enabled" @change="onDualToggle"> 启用双时段</label>
+            </div>
+            <div style="font-size:11px;color:#999;margin-bottom:8px">开启后双时段优先。选中的首个时段会带上列表下一节，一单订两场。被占用的两节不会再走单时段。场并/尝试数复用首个时段那一行。8080 和 80 通道都支持。</div>
+            <div v-if="current.dual_slot_enabled">
+              <div class="time-row" v-for="(d, di) in current.dual_slot_prefs" :key="'dual-'+di">
+                <span style="font-size:12px;color:#555;min-width:64px">首个时段</span>
+                <select v-model="d.time" @change="saveProfile" style="width:130px">
+                  <option v-for="slot in dualStartOptions" :key="slot" :value="slot">{{ slot }}</option>
+                </select>
+                <span style="font-size:12px;color:#1565c0;font-weight:600">下一节 {{ dualNextTime(d.time) || '无' }}</span>
+                <span style="font-size:11px;color:#888">优先级:</span>
+                <input type="number" v-model.number="d.priority" @change="saveProfile" min="1" max="5" style="width:50px">
+                <button class="btn btn-gray btn-sm" @click="removeDualSlot(di)">删除</button>
+              </div>
+              <button class="btn btn-blue btn-sm" style="margin-top:8px" @click="addDualSlot" :disabled="!canAddDualSlot">添加双时段</button>
+            </div>
+          </div>
+
           <!-- Time Preferences -->
           <div class="card">
             <div class="card-title">时段偏好</div>
@@ -474,6 +496,7 @@ input:focus, select:focus { border-color:#1e88e5; }
               <input type="number" v-model.number="t.parallel" @change="saveProfile" min="1" max="10" style="width:50px">
               <span style="font-size:11px;color:#888">优先级:</span>
               <input type="number" v-model.number="t.priority" @change="saveProfile" min="1" max="5" style="width:50px">
+              <span v-if="isSlotOccupiedByDual(t.time)" style="font-size:11px;color:#ef6c00">双时段占用</span>
             </div>
           </div>
         </div>
@@ -672,6 +695,12 @@ createApp({
     }
     const DEFAULT_SCHEDULE_WEEKDAYS = [0,1,2,3,4,5,6]
     const WEEKDAY_LABELS = ['周一','周二','周三','周四','周五','周六','周日']
+    const TIME_SLOT_LABELS = [
+      '08:00-09:00', '09:01-10:00', '10:01-11:00', '11:01-12:00',
+      '14:30-15:30', '15:31-16:30', '16:31-17:30', '17:31-18:30',
+      '18:31-19:30', '19:31-20:30', '20:31-21:30'
+    ]
+    const dualStartOptions = TIME_SLOT_LABELS.slice(0, -1)
     function weekdayLabel(d) { return WEEKDAY_LABELS[d] || `D${d}` }
     function normalizeProfileData(profile) {
       if (!profile) return profile
@@ -682,11 +711,19 @@ createApp({
       if (!normalized.latest_booking_result_at) normalized.latest_booking_result_at = null
       if (!Array.isArray(normalized.target_days)) normalized.target_days = [2]
       normalized.booking_channel = normalized.booking_channel === '80' ? '80' : '8080'
+      const toInt = (value, fallback) => {
+        const n = Number(value)
+        return Number.isFinite(n) ? n : fallback
+      }
+      normalized.dual_slot_enabled = !!normalized.dual_slot_enabled
+      if (Array.isArray(normalized.dual_slot_prefs)) {
+        normalized.dual_slot_prefs = normalized.dual_slot_prefs
+          .filter(d => d && d.time)
+          .map(d => ({ time: d.time, priority: toInt(d.priority ?? 1, 1) }))
+      } else {
+        normalized.dual_slot_prefs = []
+      }
       if (Array.isArray(normalized.time_prefs)) {
-        const toInt = (value, fallback) => {
-          const n = Number(value)
-          return Number.isFinite(n) ? n : fallback
-        }
         normalized.time_prefs = normalized.time_prefs.map(t => ({
           ...t,
           fanout: toInt(t.fanout ?? 4, 4),
@@ -1136,6 +1173,40 @@ createApp({
       current.value.schedule_weekdays.sort((a, b) => a - b)
       saveProfile()
     }
+    function dualNextTime(time) {
+      const idx = TIME_SLOT_LABELS.indexOf(time)
+      return idx >= 0 && idx < TIME_SLOT_LABELS.length - 1 ? TIME_SLOT_LABELS[idx + 1] : ''
+    }
+    function isSlotOccupiedByDual(time) {
+      if (!current.value || !current.value.dual_slot_enabled) return false
+      return (current.value.dual_slot_prefs || []).some(d => d.time === time || dualNextTime(d.time) === time)
+    }
+    const canAddDualSlot = computed(() => {
+      if (!current.value || !current.value.dual_slot_enabled) return false
+      const used = new Set((current.value.dual_slot_prefs || []).map(d => d.time))
+      return dualStartOptions.some(slot => !used.has(slot))
+    })
+    function onDualToggle() {
+      if (!current.value.dual_slot_prefs) current.value.dual_slot_prefs = []
+      if (current.value.dual_slot_enabled && current.value.dual_slot_prefs.length === 0) {
+        addDualSlot()
+        return
+      }
+      saveProfile()
+    }
+    function addDualSlot() {
+      if (!current.value.dual_slot_prefs) current.value.dual_slot_prefs = []
+      const used = new Set(current.value.dual_slot_prefs.map(d => d.time))
+      const start = dualStartOptions.find(slot => !used.has(slot))
+      if (!start) return
+      current.value.dual_slot_prefs.push({ time: start, priority: 1 })
+      saveProfile()
+    }
+    function removeDualSlot(index) {
+      if (!current.value.dual_slot_prefs) return
+      current.value.dual_slot_prefs.splice(index, 1)
+      saveProfile()
+    }
     function toggleCourt(vi, c) {
       const v = current.value.venue_prefs[vi]
       const idx = v.courts.indexOf(c)
@@ -1348,6 +1419,8 @@ createApp({
       testLogin, startScheduled, startImmediate, stopBooking,
       queryCourtStatus, bookCourt,
       toggleDay, toggleScheduleWeekday, toggleCourt, cyclePriority, clearLogs,
+      dualStartOptions, dualNextTime, isSlotOccupiedByDual, canAddDualSlot,
+      onDualToggle, addDualSlot, removeDualSlot,
       logFiles, selectedLogDate, displayLogs, refreshLogFiles, loadHistoryLog,
       orders, loadingOrders, ordersError, loadOrders, markLatestBookingRead,
       newPassword, changingPassword, changePwResult, changePassword

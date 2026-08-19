@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS profiles (
     target_days     TEXT NOT NULL DEFAULT '[2]',
     venue_prefs     TEXT NOT NULL DEFAULT '[]',
     time_prefs      TEXT NOT NULL DEFAULT '[]',
+    dual_slot_enabled INTEGER NOT NULL DEFAULT 0,
+    dual_slot_prefs TEXT NOT NULL DEFAULT '[]',
     schedule_enabled INTEGER NOT NULL DEFAULT 0,
     schedule_weekdays TEXT NOT NULL DEFAULT '[0, 1, 2, 3, 4, 5, 6]',
     schedule_time   TEXT NOT NULL DEFAULT '08:40:00',
@@ -87,6 +89,14 @@ async def _migrate_profiles_table(db: aiosqlite.Connection):
         await db.execute(
             "ALTER TABLE profiles ADD COLUMN booking_channel TEXT NOT NULL DEFAULT '8080'"
         )
+    if "dual_slot_enabled" not in columns:
+        await db.execute(
+            "ALTER TABLE profiles ADD COLUMN dual_slot_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+    if "dual_slot_prefs" not in columns:
+        await db.execute(
+            "ALTER TABLE profiles ADD COLUMN dual_slot_prefs TEXT NOT NULL DEFAULT '[]'"
+        )
     await db.execute(
         """
         UPDATE profiles
@@ -114,6 +124,20 @@ async def _migrate_profiles_table(db: aiosqlite.Connection):
         UPDATE profiles
         SET latest_booking_result_unread = 0
         WHERE latest_booking_result_unread IS NULL
+        """
+    )
+    await db.execute(
+        """
+        UPDATE profiles
+        SET dual_slot_enabled = 0
+        WHERE dual_slot_enabled IS NULL
+        """
+    )
+    await db.execute(
+        """
+        UPDATE profiles
+        SET dual_slot_prefs = '[]'
+        WHERE dual_slot_prefs IS NULL OR TRIM(dual_slot_prefs) = ''
         """
     )
 
@@ -152,16 +176,19 @@ async def delete_invite_code(code: str) -> bool:
 
 def _row_to_dict(row, columns) -> dict:
     d = dict(zip(columns, row))
-    for key in ("target_days", "venue_prefs", "time_prefs", "schedule_weekdays"):
+    for key in ("target_days", "venue_prefs", "time_prefs", "schedule_weekdays", "dual_slot_prefs"):
         if key in d and isinstance(d[key], str):
             try:
                 d[key] = json.loads(d[key])
             except json.JSONDecodeError:
                 d[key] = []
     d["schedule_enabled"] = bool(d.get("schedule_enabled", 0))
+    d["dual_slot_enabled"] = bool(d.get("dual_slot_enabled", 0))
     d["latest_booking_result_unread"] = bool(d.get("latest_booking_result_unread", 0))
     channel = str(d.get("booking_channel") or "8080").strip()
     d["booking_channel"] = "80" if channel in ("80", "pc", "web", "desktop") else "8080"
+    if "dual_slot_prefs" not in d or d["dual_slot_prefs"] is None:
+        d["dual_slot_prefs"] = []
     if "schedule_weekdays" not in d or d["schedule_weekdays"] is None:
         d["schedule_weekdays"] = list(DEFAULT_SCHEDULE_WEEKDAYS)
     return d
@@ -224,7 +251,7 @@ async def clone_profile(profile_id: int, name: str | None = None) -> dict | None
             """
             SELECT name, username, password, target_days, venue_prefs, time_prefs,
                    schedule_weekdays, schedule_time, schedule_mode, pre_query_delay,
-                   max_bookings, group_name, booking_channel
+                   max_bookings, group_name, booking_channel, dual_slot_enabled, dual_slot_prefs
             FROM profiles
             WHERE id = ?
             """,
@@ -240,10 +267,11 @@ async def clone_profile(profile_id: int, name: str | None = None) -> dict | None
             INSERT INTO profiles (
                 name, username, password, target_days, venue_prefs, time_prefs,
                 schedule_enabled, schedule_weekdays, schedule_time, schedule_mode,
-                pre_query_delay, max_bookings, group_name, booking_channel, status,
+                pre_query_delay, max_bookings, group_name, booking_channel,
+                dual_slot_enabled, dual_slot_prefs, status,
                 latest_booking_result, latest_booking_result_at, latest_booking_result_unread
             )
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'idle', '', NULL, 0)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', '', NULL, 0)
             """,
             (
                 clone_name,
@@ -259,6 +287,8 @@ async def clone_profile(profile_id: int, name: str | None = None) -> dict | None
                 row[10],
                 row[11],
                 row[12] if len(row) > 12 else "8080",
+                row[13] if len(row) > 13 else 0,
+                row[14] if len(row) > 14 else "[]",
             ),
         )
         await db.commit()
@@ -269,11 +299,13 @@ async def update_profile(profile_id: int, updates: dict) -> dict | None:
     if not updates:
         return await get_profile(profile_id)
     # Serialize JSON fields
-    for key in ("target_days", "venue_prefs", "time_prefs", "schedule_weekdays"):
+    for key in ("target_days", "venue_prefs", "time_prefs", "schedule_weekdays", "dual_slot_prefs"):
         if key in updates and not isinstance(updates[key], str):
             updates[key] = json.dumps(updates[key], ensure_ascii=False)
     if "schedule_enabled" in updates:
         updates["schedule_enabled"] = int(updates["schedule_enabled"])
+    if "dual_slot_enabled" in updates:
+        updates["dual_slot_enabled"] = int(updates["dual_slot_enabled"])
 
     sets = ", ".join(f"{k} = ?" for k in updates)
     vals = list(updates.values()) + [profile_id]
