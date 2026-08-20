@@ -13,6 +13,7 @@ class VenuePreference(BaseModel):
     enabled: bool = True
     courts: list[int] = []
     courtPriority: dict[str, int] = {}
+    priority: int = Field(default=1, ge=1, le=5)
 
 
 class TimePreference(BaseModel):
@@ -39,13 +40,13 @@ VENUES = [
 
 def default_venue_prefs() -> list[dict]:
     return [
-        {"id": 103, "name": "二号巨构", "enabled": True,
+        {"id": 103, "name": "二号巨构", "enabled": True, "priority": 1,
          "courts": [1, 2, 3, 4, 5, 6],
          "courtPriority": {str(c): c for c in range(1, 7)}},
-        {"id": 101, "name": "一号巨构", "enabled": True,
+        {"id": 101, "name": "一号巨构", "enabled": True, "priority": 2,
          "courts": [1, 2, 3],
          "courtPriority": {str(c): c for c in range(1, 4)}},
-        {"id": 104, "name": "三号巨构", "enabled": True,
+        {"id": 104, "name": "三号巨构", "enabled": True, "priority": 3,
          "courts": [1, 2, 3],
          "courtPriority": {str(c): c for c in range(1, 4)}},
     ]

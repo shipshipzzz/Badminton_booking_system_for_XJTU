@@ -47,6 +47,60 @@ input:focus, select:focus { border-color:#1e88e5; }
 .chip.on { background:#1e88e5; border-color:#1e88e5; color:#fff; }
 .chip .pri { position:absolute; top:-7px; right:-7px; background:#ffc107; color:#111; border-radius:10px; padding:1px 5px; font-size:10px; font-weight:800; }
 .chip.on .pri { background:rgba(255,255,255,.9); }
+.pref-hint { font-size:12px; color:#78909c; margin:-4px 0 14px; line-height:1.55; }
+.venue-list { display:flex; flex-direction:column; gap:10px; }
+.venue-block {
+  display:flex; gap:10px; align-items:flex-start;
+  background:#fff; border:1px solid #e6ebf0; border-radius:12px;
+  padding:12px 14px 12px 8px;
+  box-shadow:0 1px 2px rgba(16,24,40,.04);
+  transition:border-color .15s, box-shadow .15s, background .15s;
+}
+.venue-block:hover { border-color:#c5d0dc; box-shadow:0 3px 10px rgba(16,24,40,.06); }
+.venue-block.dragging { opacity:.4; }
+.venue-block.drag-over { border-color:#1e88e5; background:#f4f9ff; box-shadow:0 0 0 3px rgba(30,136,229,.14); }
+.venue-block.off { background:#fafbfc; }
+.venue-block.off .venue-name, .venue-block.off .venue-rank { color:#90a4ae; }
+.venue-block.off .venue-rank { background:#eceff1; }
+.venue-grip {
+  width:22px; height:32px; margin-top:2px; flex-shrink:0; cursor:grab;
+  border-radius:7px; color:#90a4ae;
+  display:flex; align-items:center; justify-content:center;
+}
+.venue-grip:hover { background:#eef2f6; color:#607d8b; }
+.venue-grip:active { cursor:grabbing; background:#e3e8ee; }
+.venue-grip svg { display:block; }
+.venue-rank {
+  width:26px; height:26px; margin-top:5px; border-radius:8px; flex-shrink:0;
+  background:#e8f4fd; color:#1565c0; font-size:13px; font-weight:800;
+  display:flex; align-items:center; justify-content:center;
+}
+.venue-block.lead .venue-rank { background:#1e88e5; color:#fff; }
+.venue-main { flex:1; min-width:0; }
+.venue-head { display:flex; align-items:center; gap:8px; margin-bottom:10px; min-height:26px; }
+.venue-name { font-weight:700; font-size:14px; color:#263238; }
+.venue-head label { display:flex; align-items:center; gap:5px; margin-left:auto; font-size:12px; color:#78909c; cursor:pointer; user-select:none; }
+.court-line { display:flex; flex-wrap:wrap; align-items:center; gap:6px; min-height:38px; padding:6px 8px; border-radius:9px; background:#f5f7fa; }
+.court-line + .court-line { margin-top:7px; }
+.court-line.selected { background:#eef6fd; }
+.court-kicker { font-size:11px; color:#90a4ae; width:28px; flex-shrink:0; font-weight:700; letter-spacing:.2px; }
+.court-chip {
+  display:inline-flex; align-items:center; gap:5px; height:26px;
+  padding:0 10px 0 6px; border-radius:999px; border:1px solid #d7dee6;
+  background:#fff; color:#546e7a; font-size:12px; font-weight:600;
+  cursor:pointer; user-select:none; transition:transform .08s, box-shadow .08s, background .08s, border-color .08s;
+}
+.court-chip:hover { border-color:#90a4ae; }
+.court-chip.on { background:#1e88e5; border-color:#1e88e5; color:#fff; cursor:grab; box-shadow:0 1px 2px rgba(21,101,192,.22); }
+.court-chip.on:hover { background:#1976d2; }
+.court-chip.on:active { cursor:grabbing; }
+.court-chip.drag-over { transform:scale(1.05); box-shadow:0 0 0 3px rgba(13,71,161,.28); }
+.court-chip-ord {
+  width:16px; height:16px; border-radius:50%; background:rgba(255,255,255,.24);
+  font-size:10px; font-weight:800; display:inline-flex; align-items:center; justify-content:center;
+}
+.court-chip:not(.on) { font-weight:500; color:#78909c; }
+.court-empty { font-size:12px; color:#b0bec5; }
 .time-row { display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid #f5f5f5; }
 .time-row label { font-size:12px; }
 .log-console { background:#1a1a2e; color:#0f0; font-family:'Consolas',monospace; font-size:11px; padding:10px; border-radius:8px; height:220px; overflow-y:auto; overflow-x:auto; white-space:pre-wrap; word-break:break-all; }
@@ -84,8 +138,6 @@ input:focus, select:focus { border-color:#1e88e5; }
   .log-layout { flex-direction:column; }
   .latest-booking-side { width:auto; }
 }
-.venue-block { border:1px solid #e9ecef; border-radius:8px; padding:10px; margin:8px 0; background:#fafafa; }
-.venue-name { font-weight:700; font-size:13px; margin-bottom:6px; }
 .add-btn { border:2px dashed #ccc; border-radius:10px; padding:12px; text-align:center; cursor:pointer; color:#999; font-size:14px; }
 .add-btn:hover { border-color:#1e88e5; color:#1e88e5; }
 /* Court query table */
@@ -324,7 +376,7 @@ input:focus, select:focus { border-color:#1e88e5; }
               <button class="btn btn-red" @click="stopBooking" :disabled="currentStatus==='idle'">停止</button>
               <button class="btn btn-cyan" @click="queryCourtStatus" :disabled="querying">{{ querying ? '查询中...' : '查询场地' }}</button>
             </div>
-            <div v-if="countdown" style="margin-top:8px;font-size:13px;color:#1565c0;font-weight:600">{{ countdown }}</div>
+            <div v-show="countdown" style="margin-top:8px;font-size:13px;color:#1565c0;font-weight:600;min-height:20px">{{ countdown }}</div>
           </div>
 
           <!-- Court Query Result -->
@@ -439,21 +491,50 @@ input:focus, select:focus { border-color:#1e88e5; }
           <!-- Venue Preferences -->
           <div class="card">
             <div class="card-title">场馆偏好</div>
-            <div style="font-size:11px;color:#999;margin-bottom:8px">点击场地选择/取消；按住 Alt/Ctrl/Shift 点击可设置优先级(1-6，数字越小越优先)</div>
-            <div class="venue-block" v-for="(v,vi) in current.venue_prefs" :key="v.id">
-              <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-                <label><input type="checkbox" v-model="v.enabled" @change="saveProfile"></label>
-                <span class="venue-name">{{ v.name }}</span>
-              </div>
-              <div>
-                <div class="chip" v-for="c in allCourts(v.id)" :key="c"
-                     :class="{on: v.courts.includes(c)}"
-                     @click="toggleCourt(vi, c)"
-                     @click.alt="cyclePriority(vi, c)"
-                     @click.ctrl="cyclePriority(vi, c)"
-                     @click.shift="cyclePriority(vi, c)">
-                  {{ c }}
-                  <span class="pri" v-if="v.courtPriority && v.courtPriority[String(c)]">{{ v.courtPriority[String(c)] }}</span>
+            <div class="pref-hint">越靠前越优先。左侧六点拖巨构顺序，蓝色胶囊拖馆内场地顺序；点一下即可选中或取消。</div>
+            <div class="venue-list">
+              <div class="venue-block" v-for="(v,vi) in current.venue_prefs" :key="v.id"
+                   :class="{lead: vi===0, dragging: drag.kind==='venue' && drag.from===vi, 'drag-over': drag.overKind==='venue' && drag.over===vi, off: !v.enabled}"
+                   @dragover.prevent="onVenueDragOver(vi, $event)"
+                   @drop.prevent="onVenueDrop(vi, $event)">
+                <div class="venue-grip" draggable="true" title="拖动调整巨构顺序"
+                     @dragstart="onVenueDragStart(vi, $event)" @dragend="onDragEnd">
+                  <svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor" aria-hidden="true">
+                    <circle cx="2.5" cy="2" r="1.35"/><circle cx="7.5" cy="2" r="1.35"/>
+                    <circle cx="2.5" cy="8" r="1.35"/><circle cx="7.5" cy="8" r="1.35"/>
+                    <circle cx="2.5" cy="14" r="1.35"/><circle cx="7.5" cy="14" r="1.35"/>
+                  </svg>
+                </div>
+                <div class="venue-rank">{{ vi + 1 }}</div>
+                <div class="venue-main">
+                  <div class="venue-head">
+                    <span class="venue-name">{{ v.name }}</span>
+                    <label><input type="checkbox" v-model="v.enabled" @change="saveProfile"> 启用</label>
+                  </div>
+                  <div class="court-line selected">
+                    <span class="court-kicker">已选</span>
+                    <div class="court-chip on" v-for="c in (v.courts || [])" :key="'on-'+c"
+                         :class="{'drag-over': drag.kind==='court' && drag.venueIndex===vi && drag.over===c}"
+                         draggable="true"
+                         @click="toggleCourt(vi, c)"
+                         @dragstart="onCourtDragStart(vi, c, $event)"
+                         @dragover.prevent="onCourtDragOver(vi, c, $event)"
+                         @drop.prevent="onCourtDrop(vi, c, $event)"
+                         @dragend="onDragEnd">
+                      <span class="court-chip-ord">{{ courtRank(v, c) }}</span>
+                      {{ c }}号
+                    </div>
+                    <span class="court-empty" v-if="!(v.courts && v.courts.length)">还没选场地</span>
+                  </div>
+                  <div class="court-line" v-if="idleCourts(v).length">
+                    <span class="court-kicker">未选</span>
+                    <div class="court-chip" v-for="c in idleCourts(v)" :key="'off-'+c"
+                         @click="toggleCourt(vi, c)"
+                         @dragover.prevent="onCourtDragOver(vi, c, $event)"
+                         @drop.prevent="onCourtDrop(vi, c, $event)">
+                      {{ c }}号
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -613,6 +694,9 @@ createApp({
     let ws = null
     let wsStatus = null
     let countdownTimer = null
+    let countdownTarget = null
+    const drag = reactive({ kind: '', from: -1, venueIndex: -1, over: null, overKind: '' })
+    let suppressCourtClick = false
 
     const VENUES = [
       { id: 101, name: '一号巨构', totalCourts: 3 },
@@ -722,6 +806,24 @@ createApp({
           .map(d => ({ time: d.time, priority: toInt(d.priority ?? 1, 1) }))
       } else {
         normalized.dual_slot_prefs = []
+      }
+      if (Array.isArray(normalized.venue_prefs)) {
+        const venues = normalized.venue_prefs.map((v, i) => {
+          const courts = Array.isArray(v.courts) ? [...v.courts] : []
+          const priMap = v.courtPriority && typeof v.courtPriority === 'object' ? v.courtPriority : {}
+          courts.sort((a, b) => toInt(priMap[String(a)], a) - toInt(priMap[String(b)], b) || a - b)
+          const courtPriority = {}
+          courts.forEach((c, idx) => { courtPriority[String(c)] = idx + 1 })
+          return {
+            ...v,
+            courts,
+            courtPriority,
+            priority: Math.min(5, Math.max(1, toInt(v.priority ?? i + 1, i + 1))),
+          }
+        })
+        venues.sort((a, b) => a.priority - b.priority || a.id - b.id)
+        venues.forEach((v, i) => { v.priority = i + 1 })
+        normalized.venue_prefs = venues
       }
       if (Array.isArray(normalized.time_prefs)) {
         normalized.time_prefs = normalized.time_prefs.map(t => ({
@@ -1207,19 +1309,111 @@ createApp({
       current.value.dual_slot_prefs.splice(index, 1)
       saveProfile()
     }
+    function displayCourts(v) {
+      const all = allCourts(v.id)
+      const selected = Array.isArray(v.courts) ? v.courts : []
+      const selectedSet = new Set(selected)
+      return [...selected, ...all.filter(c => !selectedSet.has(c))]
+    }
+    function idleCourts(v) {
+      const selected = new Set(v.courts || [])
+      return allCourts(v.id).filter(c => !selected.has(c))
+    }
+    function courtRank(v, c) {
+      const idx = (v.courts || []).indexOf(c)
+      return idx >= 0 ? idx + 1 : ''
+    }
+    function resetDrag() {
+      drag.kind = ''
+      drag.from = -1
+      drag.venueIndex = -1
+      drag.over = null
+      drag.overKind = ''
+    }
+    function moveIndex(list, from, to) {
+      if (!Array.isArray(list) || from === to || from < 0 || to < 0 || from >= list.length || to >= list.length) return false
+      const item = list.splice(from, 1)[0]
+      list.splice(to, 0, item)
+      return true
+    }
+    function syncVenuePriorities() {
+      (current.value.venue_prefs || []).forEach((v, i) => {
+        v.priority = i + 1
+        syncCourtPriorities(v)
+      })
+    }
+    function syncCourtPriorities(v) {
+      const courtPriority = {}
+      ;(v.courts || []).forEach((c, i) => { courtPriority[String(c)] = i + 1 })
+      v.courtPriority = courtPriority
+    }
+    function onVenueDragStart(vi, e) {
+      drag.kind = 'venue'
+      drag.from = vi
+      e.dataTransfer.effectAllowed = 'move'
+      e.dataTransfer.setData('text/plain', 'venue')
+      const block = e.currentTarget.closest('.venue-block')
+      if (block) e.dataTransfer.setDragImage(block, 24, 20)
+    }
+    function onVenueDragOver(vi, e) {
+      if (drag.kind !== 'venue') return
+      e.dataTransfer.dropEffect = 'move'
+      drag.overKind = 'venue'
+      drag.over = vi
+    }
+    function onVenueDrop(vi, e) {
+      if (drag.kind !== 'venue') return
+      moveIndex(current.value.venue_prefs, drag.from, vi)
+      syncVenuePriorities()
+      resetDrag()
+      saveProfile()
+    }
+    function onCourtDragStart(vi, c, e) {
+      const v = current.value.venue_prefs[vi]
+      const from = (v.courts || []).indexOf(c)
+      if (from < 0) {
+        e.preventDefault()
+        return
+      }
+      drag.kind = 'court'
+      drag.from = from
+      drag.venueIndex = vi
+      suppressCourtClick = false
+      e.dataTransfer.effectAllowed = 'move'
+      e.dataTransfer.setData('text/plain', 'court')
+    }
+    function onCourtDragOver(vi, c, e) {
+      if (drag.kind !== 'court' || drag.venueIndex !== vi) return
+      e.dataTransfer.dropEffect = 'move'
+      drag.overKind = 'court'
+      drag.over = c
+    }
+    function onCourtDrop(vi, c, e) {
+      if (drag.kind !== 'court' || drag.venueIndex !== vi) return
+      const v = current.value.venue_prefs[vi]
+      let to = (v.courts || []).indexOf(c)
+      if (to < 0) to = v.courts.length - 1
+      suppressCourtClick = true
+      if (moveIndex(v.courts, drag.from, Math.max(0, to))) {
+        syncCourtPriorities(v)
+        saveProfile()
+      }
+      resetDrag()
+    }
+    function onDragEnd() {
+      if (drag.kind === 'court') suppressCourtClick = true
+      resetDrag()
+    }
     function toggleCourt(vi, c) {
+      if (suppressCourtClick) {
+        suppressCourtClick = false
+        return
+      }
       const v = current.value.venue_prefs[vi]
       const idx = v.courts.indexOf(c)
       if (idx >= 0) v.courts.splice(idx, 1)
       else v.courts.push(c)
-      v.courts.sort((a,b) => a-b)
-      saveProfile()
-    }
-    function cyclePriority(vi, c) {
-      const v = current.value.venue_prefs[vi]
-      if (!v.courtPriority) v.courtPriority = {}
-      const cur = v.courtPriority[String(c)] || 1
-      v.courtPriority[String(c)] = cur >= 6 ? 1 : cur + 1
+      syncCourtPriorities(v)
       saveProfile()
     }
     function clearLogs() { logs.value = []; selectedLogDate.value = ''; historyLogContent.value = '' }
@@ -1342,22 +1536,51 @@ createApp({
     }
 
     // ---- Countdown ----
+    function formatCountdown(leftMs) {
+      const hh = Math.floor(leftMs / 3600000)
+      const mm = Math.floor((leftMs % 3600000) / 60000)
+      const ss = Math.floor((leftMs % 60000) / 1000)
+      return `倒计时: ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`
+    }
+    function tickCountdown() {
+      const target = parseLocalDateTime(countdownTarget)
+      if (!target) {
+        stopCountdown()
+        return
+      }
+      const left = target - new Date()
+      if (left <= 0) {
+        countdown.value = '执行中...'
+        if (countdownTimer) {
+          clearInterval(countdownTimer)
+          countdownTimer = null
+        }
+        return
+      }
+      countdown.value = formatCountdown(left)
+    }
     function startCountdown(targetValue) {
-      stopCountdown()
-      countdownTimer = setInterval(() => {
-        const now = new Date()
-        const target = parseLocalDateTime(targetValue)
-        if (!target) { stopCountdown(); return }
-        const left = target - now
-        if (left <= 0) { countdown.value = '执行中...'; stopCountdown(); return }
-        const hh = Math.floor(left/3600000)
-        const mm = Math.floor((left%3600000)/60000)
-        const ss = Math.floor((left%60000)/1000)
-        countdown.value = `倒计时: ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`
-      }, 200)
+      if (!targetValue) {
+        stopCountdown()
+        return
+      }
+      if (countdownTimer && countdownTarget === targetValue) return
+      countdownTarget = targetValue
+      if (countdownTimer) {
+        clearInterval(countdownTimer)
+        countdownTimer = null
+      }
+      tickCountdown()
+      if (countdown.value && countdown.value !== '执行中...') {
+        countdownTimer = setInterval(tickCountdown, 200)
+      }
     }
     function stopCountdown() {
-      if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null }
+      if (countdownTimer) {
+        clearInterval(countdownTimer)
+        countdownTimer = null
+      }
+      countdownTarget = null
       countdown.value = ''
     }
 
@@ -1414,11 +1637,13 @@ createApp({
       profiles, groupedProfiles, showGroupLabels, isGroupCollapsed, toggleGroupCollapsed, view, currentId, current, tab, logs, lastLogs,
       loginTesting, loginResult, cloning, countdown, logConsole, currentStatus,
       querying, courtData, queryDate,
-      statusColor, statusLabel, dayLabel, weekdayLabel, allCourts,
+      statusColor, statusLabel, dayLabel, weekdayLabel, allCourts, displayCourts, idleCourts, courtRank, drag,
       loadProfiles, selectProfile, addProfile, deleteProfile, cloneProfile, saveProfile, setBookingChannel,
       testLogin, startScheduled, startImmediate, stopBooking,
       queryCourtStatus, bookCourt,
-      toggleDay, toggleScheduleWeekday, toggleCourt, cyclePriority, clearLogs,
+      toggleDay, toggleScheduleWeekday, toggleCourt, clearLogs,
+      onVenueDragStart, onVenueDragOver, onVenueDrop,
+      onCourtDragStart, onCourtDragOver, onCourtDrop, onDragEnd,
       dualStartOptions, dualNextTime, isSlotOccupiedByDual, canAddDualSlot,
       onDualToggle, addDualSlot, removeDualSlot,
       logFiles, selectedLogDate, displayLogs, refreshLogFiles, loadHistoryLog,

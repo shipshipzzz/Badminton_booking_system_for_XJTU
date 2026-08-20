@@ -33,9 +33,12 @@ from booking_api import (  # noqa: E402
     query_times,
     query_seats,
     fetch_captcha,
+    fetch_ok_area,
     submit_order,
     submit_booking,
     generate_yzm_data,
+    _times_from_ok_area,
+    seats_from_ok_area,
 )
 
 import httpx  # noqa: E402
@@ -93,6 +96,11 @@ class ProfileRuntime:
     captcha_lock: threading.Lock = field(default_factory=threading.Lock)
     prefetch_lock: threading.Lock = field(default_factory=threading.Lock)
     book_lock: threading.Lock = field(default_factory=threading.Lock)
+    candidates_lock: threading.Lock = field(default_factory=threading.Lock)
+    query_seq: int = 0
+    applied_query_seq: int = 0
+    applied_query_started_at: float = 0.0
+    query_cutoff_at: float = 0.0
     continuous_query_running: bool = False
     session_ready: bool = False
     session_ready_reason: str = "not checked"
@@ -223,6 +231,45 @@ def get_runtime(profile_id: int) -> ProfileRuntime:
     if profile_id not in _runtimes:
         _runtimes[profile_id] = ProfileRuntime(profile_id=profile_id)
     return _runtimes[profile_id]
+
+
+def reset_query_snapshot(rt: ProfileRuntime) -> None:
+    """Clear the live snapshot. In-flight queries started before this cutoff cannot apply."""
+    with rt.candidates_lock:
+        rt.cached_candidates = {}
+        rt.query_seq = 0
+        rt.applied_query_seq = 0
+        rt.applied_query_started_at = 0.0
+        rt.query_cutoff_at = time.time()
+
+
+def begin_query_seq(rt: ProfileRuntime) -> tuple[int, float]:
+    with rt.candidates_lock:
+        rt.query_seq += 1
+        return rt.query_seq, time.time()
+
+
+def apply_query_candidates(rt: ProfileRuntime, seq: int, candidates: dict,
+                           started_at: float | None = None) -> bool:
+    """Keep the snapshot from the latest-started query. An earlier query can still
+    fill an empty/older snapshot if nothing newer has applied yet."""
+    with rt.candidates_lock:
+        if started_at is None:
+            started_at = time.time()
+        if started_at < rt.query_cutoff_at:
+            return False
+        applied_at = rt.applied_query_started_at
+        if started_at < applied_at or (started_at == applied_at and seq < rt.applied_query_seq):
+            return False
+        rt.applied_query_seq = seq
+        rt.applied_query_started_at = started_at
+        rt.cached_candidates = candidates
+        return True
+
+
+def copy_slot_candidates(rt: ProfileRuntime, *slot_times: str) -> list[list]:
+    with rt.candidates_lock:
+        return [list(rt.cached_candidates.get(time_str, [])) for time_str in slot_times]
 
 
 def remove_runtime(profile_id: int):
@@ -364,6 +411,11 @@ def query_times_anonymous(venue_id: int, date: str, channel: str = "8080") -> li
 def query_seats_anonymous(venue_id: int, stock_id: str, date: str = "", channel: str = "8080") -> list:
     with lease_anonymous_client() as client:
         return query_seats(client, venue_id, stock_id, date or None, channel)
+
+
+def query_ok_area_anonymous(venue_id: int, date: str, channel: str = "8080") -> list:
+    with lease_anonymous_client() as client:
+        return fetch_ok_area(client, venue_id, date, channel)
 
 
 def _has_booking_cookies(client: httpx.Client) -> bool:
@@ -544,10 +596,14 @@ def do_prefetch_captchas(profile_id: int, count: int = 6) -> list:
 
 # ==================== Step 3: Query Courts (Anonymous, T-Xms) ====================
 
-def do_query_candidates(profile_id: int, profile: dict) -> dict:
+def do_query_candidates(profile_id: int, profile: dict, seq: int | None = None,
+                        started_at: float | None = None) -> dict:
     """
     Query available courts using ANONYMOUS clients in parallel.
     This avoids session contention with the booking requests.
+    Always fetches live occupancy. The snapshot is applied by request-start
+    time so a slower earlier query cannot overwrite a later one, but can still
+    fill the snapshot if nothing newer has arrived.
     Returns {timeSlot: [candidates sorted by priority]}
     """
     log = lambda msg: log_manager.emit(profile_id, msg)
@@ -558,28 +614,60 @@ def do_query_candidates(profile_id: int, profile: dict) -> dict:
     rt = get_runtime(profile_id)
     channel = profile_channel(profile, rt)
     rt.channel = channel
+    if seq is None or started_at is None:
+        seq, started_at = begin_query_seq(rt)
 
     if not venue_prefs or not slot_times:
+        apply_query_candidates(rt, seq, {}, started_at)
         return {}
+
+    venue_rank = {vp["id"]: i + 1 for i, vp in enumerate(venue_prefs)}
 
     results = {time_str: [] for time_str in slot_times}
     total_started = time.perf_counter()
+    seat_mode = get_channel(channel).seat_mode
 
     stage1_started = time.perf_counter()
     venue_times_map: dict[int, list] = {}
+    venue_rows_map: dict[int, list] = {}
+    fetch_ok = 0
+    fetch_failed = 0
     venue_workers = min(QUERY_MAX_WORKERS, len(venue_prefs))
     with ThreadPoolExecutor(max_workers=venue_workers) as executor:
-        future_to_venue = {
-            executor.submit(query_times_anonymous, vp["id"], date, channel): vp
-            for vp in venue_prefs
-        }
-        for future in future_to_venue:
-            vp = future_to_venue[future]
-            try:
-                venue_times_map[vp["id"]] = future.result()
-            except Exception as e:
-                venue_times_map[vp["id"]] = []
-                log(f"[Query] {vp['name']} times failed: {e}")
+        if seat_mode == "ok_area":
+            future_to_venue = {
+                executor.submit(query_ok_area_anonymous, vp["id"], date, channel): vp
+                for vp in venue_prefs
+            }
+            for future in future_to_venue:
+                vp = future_to_venue[future]
+                try:
+                    rows = future.result()
+                except Exception as e:
+                    rows = None
+                    log(f"[Query] {vp['name']} times failed: {e}")
+                if rows is None:
+                    fetch_failed += 1
+                    venue_rows_map[vp["id"]] = []
+                    venue_times_map[vp["id"]] = []
+                    continue
+                fetch_ok += 1
+                venue_rows_map[vp["id"]] = rows
+                venue_times_map[vp["id"]] = _times_from_ok_area(rows)
+        else:
+            future_to_venue = {
+                executor.submit(query_times_anonymous, vp["id"], date, channel): vp
+                for vp in venue_prefs
+            }
+            for future in future_to_venue:
+                vp = future_to_venue[future]
+                try:
+                    venue_times_map[vp["id"]] = future.result()
+                    fetch_ok += 1
+                except Exception as e:
+                    venue_times_map[vp["id"]] = []
+                    fetch_failed += 1
+                    log(f"[Query] {vp['name']} times failed: {e}")
 
     seat_jobs = []
     for time_str in slot_times:
@@ -591,62 +679,95 @@ def do_query_candidates(profile_id: int, profile: dict) -> dict:
 
     stage2_started = time.perf_counter()
     if seat_jobs:
-        seat_workers = min(QUERY_MAX_WORKERS, len(seat_jobs))
-        with ThreadPoolExecutor(max_workers=seat_workers) as executor:
-            future_to_job = {
-                executor.submit(query_seats_anonymous, vp["id"], slot["ID"], date, channel): (time_str, vp, slot)
-                for time_str, vp, slot in seat_jobs
-            }
-            for future in future_to_job:
-                time_str, vp, slot = future_to_job[future]
-                try:
-                    seats = future.result()
-                except Exception as e:
-                    log(f"[Query] {vp['name']} seats failed: {e}")
-                    continue
-
-                allowed = set(vp.get("courts", []))
-                court_priority = vp.get("courtPriority", {})
-                for seat in seats:
-                    if not seat["available"]:
+        if seat_mode == "ok_area":
+            for time_str, vp, slot in seat_jobs:
+                seats = seats_from_ok_area(venue_rows_map.get(vp["id"], []), slot["ID"])
+                _append_seat_candidates(
+                    results, time_str, vp, slot, seats, date, venue_rank.get(vp["id"], 1)
+                )
+        else:
+            seat_workers = min(QUERY_MAX_WORKERS, len(seat_jobs))
+            with ThreadPoolExecutor(max_workers=seat_workers) as executor:
+                future_to_job = {
+                    executor.submit(query_seats_anonymous, vp["id"], slot["ID"], date, channel): (time_str, vp, slot)
+                    for time_str, vp, slot in seat_jobs
+                }
+                for future in future_to_job:
+                    time_str, vp, slot = future_to_job[future]
+                    try:
+                        seats = future.result()
+                    except Exception as e:
+                        log(f"[Query] {vp['name']} seats failed: {e}")
                         continue
-                    if allowed and seat["courtNumber"] not in allowed:
-                        continue
-                    pri = court_priority.get(str(seat["courtNumber"]), seat["courtNumber"])
-                    results[time_str].append({
-                        "venueId": vp["id"],
-                        "venueName": vp["name"],
-                        "date": date,
-                        "timeSlot": slot.get("TIME_NO", time_str),
-                        "stockId": slot["ID"],
-                        "court": {
-                            "courtNumber": seat["courtNumber"],
-                            "courtName": f"场地{seat['courtNumber']}",
-                            "seatId": seat["seatId"],
-                        },
-                        "priority": pri,
-                    })
+                    _append_seat_candidates(
+                        results, time_str, vp, slot, seats, date, venue_rank.get(vp["id"], 1)
+                    )
 
     for time_no in results:
-        results[time_no].sort(key=lambda c: c["priority"])
+        results[time_no].sort(key=lambda c: (
+            c.get("venuePriority", 99),
+            c.get("priority", 99),
+            c.get("venueId", 0),
+            c["court"]["courtNumber"],
+        ))
 
     total = sum(len(v) for v in results.values())
     active_slots = [k for k, v in results.items() if v]
     total_ms = (time.perf_counter() - total_started) * 1000
     stage1_ms = (stage2_started - stage1_started) * 1000
     stage2_ms = (time.perf_counter() - stage2_started) * 1000
+    if fetch_ok == 0 and fetch_failed > 0:
+        log(
+            f"[Query] #{seq} {date}: all venues failed "
+            f"(times:{stage1_ms:.0f}ms seats:{stage2_ms:.0f}ms total:{total_ms:.0f}ms), keep previous snapshot"
+        )
+        return results
+    applied = apply_query_candidates(rt, seq, results, started_at)
+    stale = "" if applied else " stale-discarded"
     log(
-        f"[Query] {date}: {total} candidates in {len(active_slots)} slots "
-        f"(times:{stage1_ms:.0f}ms seats:{stage2_ms:.0f}ms total:{total_ms:.0f}ms)"
+        f"[Query] #{seq} {date}: {total} candidates in {len(active_slots)} slots "
+        f"(times:{stage1_ms:.0f}ms seats:{stage2_ms:.0f}ms total:{total_ms:.0f}ms){stale}"
     )
     for slot_time in active_slots:
         courts = results[slot_time]
         court_list = ", ".join(
-            f"{c['venueName']} {c['court']['courtName']}(P{c['priority']})"
+            f"{c['venueName']} 场地{c['court']['courtNumber']}(馆{c.get('venuePriority', '?')}/场{c.get('priority', '?')})"
             for c in courts
         )
         log(f"[Query]   {slot_time}: {court_list}")
     return results
+
+
+def _append_seat_candidates(results: dict, time_str: str, vp: dict, slot: dict,
+                            seats: list, date: str, fallback_venue_pri: int = 1) -> None:
+    allowed = set(vp.get("courts", []))
+    court_priority = vp.get("courtPriority", {})
+    raw = vp.get("priority")
+    try:
+        venue_pri = fallback_venue_pri if raw is None or raw == "" else int(raw)
+    except (TypeError, ValueError):
+        venue_pri = fallback_venue_pri
+    venue_pri = max(1, min(venue_pri, 5))
+    for seat in seats:
+        if not seat["available"]:
+            continue
+        if allowed and seat["courtNumber"] not in allowed:
+            continue
+        pri = court_priority.get(str(seat["courtNumber"]), seat["courtNumber"])
+        results[time_str].append({
+            "venueId": vp["id"],
+            "venueName": vp["name"],
+            "venuePriority": venue_pri,
+            "date": date,
+            "timeSlot": slot.get("TIME_NO", time_str),
+            "stockId": slot["ID"],
+            "court": {
+                "courtNumber": seat["courtNumber"],
+                "courtName": f"场地{seat['courtNumber']}",
+                "seatId": seat["seatId"],
+            },
+            "priority": pri,
+        })
 
 
 # ==================== Step 4: Book Single Court ====================
@@ -795,7 +916,7 @@ def _book_time_slot(profile_id: int, time_slot: str, fanout: int,
             if slot_state["success"] or slot_state["same_slot_booked"] or slot_state["tried"] >= fanout:
                 return None, None
 
-            slot_candidates = rt.cached_candidates.get(time_slot, [])
+            slot_candidates = copy_slot_candidates(rt, time_slot)[0]
             for candidate in slot_candidates:
                 court_key = f"{candidate['venueId']}_{candidate['court']['courtNumber']}"
                 if court_key in tried_courts:
@@ -892,10 +1013,8 @@ def _book_dual_slot(profile_id: int, dual_pref: dict, shared: dict) -> dict:
         with slot_lock:
             if slot_state["success"] or slot_state["same_slot_booked"] or slot_state["tried"] >= fanout:
                 return None, None
-            pairs = pick_dual_pairs(
-                rt.cached_candidates.get(start_time, []),
-                rt.cached_candidates.get(next_time, []),
-            )
+            first_slot, second_slot = copy_slot_candidates(rt, start_time, next_time)
+            pairs = pick_dual_pairs(first_slot, second_slot)
             for first, second in pairs:
                 court_key = f"{first['venueId']}_{first['court']['courtNumber']}"
                 if court_key in tried_courts:
@@ -1052,15 +1171,17 @@ def run_booking_flow(profile_id: int, profile: dict):
             return build_booking_flow_result(profile, persist=False)
 
         # Fallback: Query if not already done by continuous query
-        if not rt.cached_candidates or not any(rt.cached_candidates.values()):
+        snapshot = copy_slot_candidates(rt, *collect_query_slot_times(profile))
+        if not any(snapshot):
             log("[T=0] No cached candidates (continuous query missed), querying now...")
-            rt.cached_candidates = do_query_candidates(profile_id, profile)
-            if not any(rt.cached_candidates.values()):
+            do_query_candidates(profile_id, profile)
+            snapshot = copy_slot_candidates(rt, *collect_query_slot_times(profile))
+            if not any(snapshot):
                 log("[T=0] No available candidates found")
                 set_status("failed")
                 return build_booking_flow_result(profile, [])
 
-        total = sum(len(v) for v in rt.cached_candidates.values())
+        total = sum(len(v) for v in snapshot)
         log(f"[T=0] Using {total} cached candidates")
 
         if rt.cancel_event.is_set():

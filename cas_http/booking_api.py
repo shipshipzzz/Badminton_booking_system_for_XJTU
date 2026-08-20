@@ -6,19 +6,15 @@ import json
 import math
 import random
 import re
-import threading
 import time
 from urllib.parse import urlencode
 
 import httpx
 
-from site_config import get_channel, normalize_channel
+from site_config import get_channel
 
 
 AJAX_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
-_OK_AREA_TTL = 2.5
-_ok_area_cache: dict = {}
-_ok_area_lock = threading.Lock()
 
 
 def _cfg(channel=None, client=None):
@@ -42,58 +38,26 @@ def _get_with_retry(client, url, headers=None, retries=4, delay=0.35):
     return last
 
 
-def _ok_area_cache_get(channel, venue_id, date):
-    key = (normalize_channel(channel), int(venue_id), str(date))
-    now = time.time()
-    with _ok_area_lock:
-        hit = _ok_area_cache.get(key)
-        if hit and now - hit[0] < _OK_AREA_TTL:
-            return hit[1]
-    return None
-
-
-def _ok_area_cache_put(channel, venue_id, date, rows):
-    key = (normalize_channel(channel), int(venue_id), str(date))
-    with _ok_area_lock:
-        _ok_area_cache[key] = (time.time(), rows)
-
-
-def _ok_area_cache_by_stock(channel, venue_id, stock_id):
-    sid = str(stock_id)
-    ch = normalize_channel(channel)
-    with _ok_area_lock:
-        items = list(_ok_area_cache.items())
-    for (cached_ch, cached_venue, _date), (_ts, rows) in items:
-        if cached_ch != ch or int(cached_venue) != int(venue_id):
-            continue
-        if any(str(row.get("stockid")) == sid for row in rows):
-            return rows
-    return None
-
-
 def fetch_ok_area(client, venue_id, date, channel=None):
+    """Always hit the official API. No cross-query cache."""
     cfg = _cfg(channel, client)
-    cached = _ok_area_cache_get(cfg.id, venue_id, date)
-    if cached is not None:
-        return cached
     url = cfg.api_url(f"/product/findOkArea.html?s_date={date}&serviceid={venue_id}&_={int(time.time()*1000)}")
     resp = _get_with_retry(client, url, headers=_headers(cfg))
     if resp is None or resp.status_code != 200 or not resp.content:
-        return []
+        return None
     try:
         data = resp.json()
     except Exception:
-        return []
+        return None
     rows = data.get("object") or []
     if not isinstance(rows, list):
         return []
-    _ok_area_cache_put(cfg.id, venue_id, date, rows)
     return rows
 
 
 def _times_from_ok_area(rows):
     by_stock = {}
-    for row in rows:
+    for row in rows or []:
         stock_id = row.get("stockid")
         if stock_id is None:
             continue
@@ -134,6 +98,52 @@ def query_times(client, venue_id, date, channel=None):
     return _query_times_findtime(client, cfg, venue_id, date)
 
 
+def _slot_payload(slot, seats):
+    return {
+        "time": slot["TIME_NO"],
+        "stockId": slot["ID"],
+        "surplus": int(slot.get("SURPLUS") or 0),
+        "allCount": int(slot.get("ALL_COUNT") or 0),
+        "seats": seats,
+    }
+
+
+def query_venue_occupancy(client, venue_id, date, channel=None):
+    """One official occupancy fetch per venue, then split times/seats locally."""
+    cfg = _cfg(channel, client)
+    if cfg.seat_mode == "ok_area":
+        rows = fetch_ok_area(client, venue_id, date, cfg.id)
+        if rows is None:
+            times = _query_times_findtime(client, cfg, venue_id, date)
+            return [_slot_payload(slot, []) for slot in times]
+        return [
+            _slot_payload(slot, seats_from_ok_area(rows, slot["ID"]))
+            for slot in _times_from_ok_area(rows)
+        ]
+    times = _query_times_findtime(client, cfg, venue_id, date)
+    return [
+        _slot_payload(slot, _query_seats_html(client, cfg, venue_id, slot["ID"]))
+        for slot in times
+    ]
+
+
+def seats_from_ok_area(rows, stock_id) -> list:
+    seats = []
+    for row in rows or []:
+        if str(row.get("stockid")) != str(stock_id):
+            continue
+        try:
+            court_number = int(row.get("name") or row.get("num"))
+        except (TypeError, ValueError):
+            continue
+        seats.append({
+            "courtNumber": court_number,
+            "seatId": str(row.get("id")),
+            "available": row.get("status") == 1,
+        })
+    return seats
+
+
 def _query_seats_html(client, cfg, venue_id, stock_id):
     url = cfg.api_url(
         f"/seat/seat.html?id={venue_id}&type=2&stockid={stock_id}&json=html&_={int(time.time()*1000)}"
@@ -166,27 +176,9 @@ def query_seats(client, venue_id, stock_id, date=None, channel=None):
     cfg = _cfg(channel, client)
     if cfg.seat_mode == "seat_html":
         return _query_seats_html(client, cfg, venue_id, stock_id)
-
-    rows = fetch_ok_area(client, venue_id, date, cfg.id) if date else None
-    if rows is None:
-        rows = _ok_area_cache_by_stock(cfg.id, venue_id, stock_id) or []
-        if not rows and date:
-            rows = fetch_ok_area(client, venue_id, date, cfg.id)
-
-    seats = []
-    for row in rows:
-        if str(row.get("stockid")) != str(stock_id):
-            continue
-        try:
-            court_number = int(row.get("name") or row.get("num"))
-        except (TypeError, ValueError):
-            continue
-        seats.append({
-            "courtNumber": court_number,
-            "seatId": str(row.get("id")),
-            "available": row.get("status") == 1,
-        })
-    return seats
+    if not date:
+        return []
+    return seats_from_ok_area(fetch_ok_area(client, venue_id, date, cfg.id), stock_id)
 
 
 def fetch_captcha(client, channel=None):

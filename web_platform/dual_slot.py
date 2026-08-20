@@ -102,7 +102,13 @@ def pick_dual_pairs(first_candidates: list[dict], second_candidates: list[dict])
         if not second:
             continue
         pairs.append((first, second))
-    pairs.sort(key=lambda pair: (pair[0].get("priority", 99), pair[1].get("priority", 99)))
+    pairs.sort(key=lambda pair: (
+        pair[0].get("venuePriority", 99),
+        pair[0].get("priority", 99),
+        pair[1].get("priority", 99),
+        pair[0].get("venueId", 0),
+        pair[0]["court"]["courtNumber"],
+    ))
     return pairs
 
 

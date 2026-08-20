@@ -782,7 +782,7 @@ async def query_venues(venue_id: int, date: str, channel: str = "8080"):
     if _cas_path not in _sys.path:
         _sys.path.insert(0, _cas_path)
     import httpx
-    from booking_api import query_times as _qt, query_seats as _qs
+    from booking_api import query_venue_occupancy as _occupancy
     from site_config import get_channel as _get_channel
 
     cfg = _get_channel(channel)
@@ -791,18 +791,7 @@ async def query_venues(venue_id: int, date: str, channel: str = "8080"):
         client = httpx.Client(timeout=10, headers={"User-Agent": cfg.user_agent})
         client.booking_channel = cfg.id
         try:
-            times = _qt(client, venue_id, date, cfg.id)
-            result = []
-            for t in times:
-                seats = _qs(client, venue_id, t["ID"], date, cfg.id)
-                result.append({
-                    "time": t["TIME_NO"],
-                    "stockId": t["ID"],
-                    "surplus": int(t.get("SURPLUS") or 0),
-                    "allCount": int(t.get("ALL_COUNT") or 0),
-                    "seats": seats,
-                })
-            return result
+            return _occupancy(client, venue_id, date, cfg.id)
         finally:
             client.close()
 

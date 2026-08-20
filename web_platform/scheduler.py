@@ -116,7 +116,7 @@ async def _do_schedule_profile(profile_id: int, target: datetime | None = None, 
     # Reset runtime state for new schedule
     rt = booking_engine.get_runtime(profile_id)
     rt.cancel_event.clear()
-    rt.cached_candidates = {}
+    booking_engine.reset_query_snapshot(rt)
     booking_engine.clear_prefetched_captchas(rt)
     booking_engine.mark_session_ready(rt, False, "not checked")
 
@@ -173,6 +173,14 @@ async def _do_schedule_profile(profile_id: int, target: datetime | None = None, 
     return target
 
 
+def stop_query_polling(rt) -> None:
+    """Stop spawning new ticks. In-flight queries keep running and may still apply by start time."""
+    rt.continuous_query_running = False
+    if getattr(rt, "query_task", None) and not rt.query_task.done():
+        rt.query_task.cancel()
+    rt.query_task = None
+
+
 def cancel_profile(profile_id: int, cancel_runtime: bool = True, cancel_booking_task: bool = True):
     for prefix in _JOB_IDS:
         try:
@@ -181,12 +189,9 @@ def cancel_profile(profile_id: int, cancel_runtime: bool = True, cancel_booking_
             pass
 
     rt = booking_engine.get_runtime(profile_id)
-    rt.continuous_query_running = False
+    stop_query_polling(rt)
     if cancel_runtime:
         rt.cancel_event.set()
-    if hasattr(rt, "query_task") and rt.query_task and not rt.query_task.done():
-        rt.query_task.cancel()
-    rt.query_task = None
     if cancel_booking_task and rt.task and not rt.task.done():
         rt.task.cancel()
 
@@ -336,6 +341,14 @@ async def _run_continuous_query(profile_id: int, query_anchor_ts: float | None =
                 return True
             await asyncio.sleep(min(remaining, QUERY_SLEEP_CHUNK_SECONDS))
 
+    async def _query_once(seq: int, started_at: float, attempt_no: int):
+        try:
+            await asyncio.to_thread(
+                booking_engine.do_query_candidates, profile_id, profile, seq, started_at
+            )
+        except Exception as e:
+            log_manager.emit(profile_id, f"[Query #{attempt_no}] Error: {e}")
+
     async def _poll():
         attempts = 0
         tick_index = 0
@@ -362,12 +375,12 @@ async def _run_continuous_query(profile_id: int, query_anchor_ts: float | None =
                     tick_index = next_tick_index
                     if not await _sleep_until(next_tick_ts):
                         break
-            try:
-                candidates = await asyncio.to_thread(
-                    booking_engine.do_query_candidates, profile_id, profile)
-                rt.cached_candidates = candidates
-            except Exception as e:
-                log_manager.emit(profile_id, f"[Query #{attempts + 1}] Error: {e}")
+            attempt_no = attempts + 1
+            seq, started_at = booking_engine.begin_query_seq(rt)
+            asyncio.create_task(
+                _query_once(seq, started_at, attempt_no),
+                name=f"query-{profile_id}-{seq}",
+            )
             attempts += 1
             tick_index += 1
         if attempts >= MAX_QUERY_UPDATES:
@@ -424,11 +437,8 @@ async def _run_booking(profile_id: int):
     await database.update_status(profile_id, "running")
     result = await asyncio.to_thread(booking_engine.run_booking_flow, profile_id, profile)
 
-    # Stop continuous query
-    rt.continuous_query_running = False
-    if hasattr(rt, 'query_task') and rt.query_task and not rt.query_task.done():
-        rt.query_task.cancel()
-    rt.query_task = None
+    # Stop spawning new ticks; in-flight queries may still update the snapshot.
+    stop_query_polling(rt)
 
     if result and result.get("persist_latest_result"):
         await database.record_booking_result(

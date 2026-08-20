@@ -23,10 +23,11 @@ from booking_api import _order_param
 from main import _summarize_order_detail_rows
 
 
-def _court(venue_id, court_number, time_slot, stock_id, seat_id, priority=1, venue_name="二号巨构"):
+def _court(venue_id, court_number, time_slot, stock_id, seat_id, priority=1, venue_name="二号巨构", venue_priority=1):
     return {
         "venueId": venue_id,
         "venueName": venue_name,
+        "venuePriority": venue_priority,
         "timeSlot": time_slot,
         "stockId": stock_id,
         "priority": priority,
@@ -116,6 +117,23 @@ class DualSlotHelperTests(unittest.TestCase):
         self.assertEqual(pairs[0][0]["venueId"], 103)
         self.assertEqual(pairs[0][1]["stockId"], "s2")
 
+    def test_pick_pairs_orders_by_venue_then_court(self):
+        first = [
+            _court(104, 1, "19:31-20:30", "a1", "a", priority=1, venue_priority=3, venue_name="三号巨构"),
+            _court(103, 2, "19:31-20:30", "b2", "b", priority=2, venue_priority=1, venue_name="二号巨构"),
+            _court(103, 1, "19:31-20:30", "b1", "c", priority=1, venue_priority=1, venue_name="二号巨构"),
+        ]
+        second = [
+            _court(104, 1, "20:31-21:30", "a2", "d", priority=1, venue_priority=3, venue_name="三号巨构"),
+            _court(103, 2, "20:31-21:30", "b4", "e", priority=2, venue_priority=1, venue_name="二号巨构"),
+            _court(103, 1, "20:31-21:30", "b3", "f", priority=1, venue_priority=1, venue_name="二号巨构"),
+        ]
+        pairs = pick_dual_pairs(first, second)
+        self.assertEqual(
+            [(p[0]["venueId"], p[0]["court"]["courtNumber"]) for p in pairs],
+            [(103, 1), (103, 2), (104, 1)],
+        )
+
     def test_wave_skips_dual_after_success(self):
         duals = [
             {"time": "17:31-18:30", "next_time": "18:31-19:30", "priority": 1},
@@ -180,6 +198,41 @@ class OrderParamTests(unittest.TestCase):
         self.assertEqual(param["stock"], {"445080": "1", "445081": "1"})
         self.assertEqual(param["stockdetail"], {"445080": "seatA", "445081": "seatB"})
         self.assertEqual(param["stockdetailids"], "seatA,seatB")
+
+
+class QuerySnapshotTests(unittest.TestCase):
+    def test_later_started_query_wins_if_earlier_finishes_last(self):
+        from booking_engine import ProfileRuntime, apply_query_candidates
+
+        rt = ProfileRuntime(profile_id=1)
+        self.assertTrue(apply_query_candidates(rt, 1, {"a": [{"id": 1}]}, started_at=1.0))
+        self.assertTrue(apply_query_candidates(rt, 2, {"b": [{"id": 2}]}, started_at=2.0))
+        self.assertEqual(list(rt.cached_candidates), ["b"])
+        self.assertFalse(apply_query_candidates(rt, 1, {"a": [{"id": 9}]}, started_at=1.0))
+        self.assertEqual(list(rt.cached_candidates), ["b"])
+
+    def test_earlier_query_still_applies_if_newer_has_not_landed(self):
+        from booking_engine import ProfileRuntime, apply_query_candidates
+
+        rt = ProfileRuntime(profile_id=1)
+        self.assertTrue(apply_query_candidates(rt, 1, {"a": [{"id": 1}]}, started_at=1.0))
+        self.assertEqual(list(rt.cached_candidates), ["a"])
+        self.assertTrue(apply_query_candidates(rt, 2, {"b": [{"id": 2}]}, started_at=2.0))
+        self.assertEqual(list(rt.cached_candidates), ["b"])
+
+    def test_reset_rejects_queries_started_before_cutoff(self):
+        from booking_engine import ProfileRuntime, apply_query_candidates, reset_query_snapshot
+
+        rt = ProfileRuntime(profile_id=1)
+        self.assertTrue(apply_query_candidates(rt, 4, {"old": [{"id": 1}]}, started_at=10.0))
+        reset_query_snapshot(rt)
+        self.assertEqual(rt.cached_candidates, {})
+        self.assertFalse(apply_query_candidates(rt, 4, {"old": [{"id": 9}]}, started_at=10.0))
+        self.assertEqual(rt.cached_candidates, {})
+        self.assertTrue(apply_query_candidates(rt, 1, {"new": [{"id": 2}]}, started_at=rt.query_cutoff_at + 0.001))
+        self.assertEqual(list(rt.cached_candidates), ["new"])
+        self.assertFalse(apply_query_candidates(rt, 20, {"old": [{"id": 3}]}, started_at=10.0))
+        self.assertEqual(list(rt.cached_candidates), ["new"])
 
 
 if __name__ == "__main__":
