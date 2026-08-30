@@ -4,7 +4,7 @@
 
 > 本项目仅供学习、研究与个人使用。请遵守学校场馆预约规则，并妥善保护个人账号信息。
 
-![羽毛球场地预约管理界面](./booking-dashboard.png)
+![羽毛球场地预约管理界面](./docs/images/booking-dashboard.png)
 
 ## 主要功能
 
@@ -30,8 +30,10 @@ Badminton_booking_system_for_XJTU/
 │   └── static/index.html       # Vue 3 Web UI
 ├── cas_http/                   # CAS 登录与场馆 HTTP API
 ├── slider_match/               # OpenCV 滑块匹配
-├── booking-dashboard.png       # 预约管理主界面截图
-├── preference-settings.png     # 场馆偏好与双时段截图
+├── docs/
+│   └── images/                 # README 界面截图
+│       ├── booking-dashboard.png
+│       └── preference-settings.png
 └── README.md
 ```
 
@@ -91,7 +93,7 @@ python main.py
 | 提前查询 | 在正式预约前多少毫秒开始查场，界面范围 0～5000 ms。 |
 | 预约通道 | 登录、查场、滑块和下单均走所选通道；切换后需要重新登录。 |
 
-![场馆偏好与双时段设置](./preference-settings.png)
+![场馆偏好与双时段设置](./docs/images/preference-settings.png)
 
 ## 关键设计
 
