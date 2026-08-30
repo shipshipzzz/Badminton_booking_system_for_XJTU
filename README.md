@@ -1,52 +1,159 @@
-# Badminton Booking Manager
+# 西安交通大学羽毛球场地预约管理系统
 
-The project is now centered on `web_platform`, a FastAPI backend with a single-page Web UI for account management, scheduled booking, court queries, slider matching, and booking submission.
+一个面向西安交通大学羽毛球场地预约场景的本地 Web 管理工具。项目使用 FastAPI、Vue 3、SQLite 和 APScheduler，支持多账号管理、CAS 登录、场地查询、定时预约、滑块识别、订单查询与实时日志。
 
-## Structure
+> 本项目仅供学习、研究与个人使用。请遵守学校场馆预约规则，并妥善保护个人账号信息。
+
+![羽毛球场地预约管理界面](./booking-dashboard.png)
+
+## 主要功能
+
+- 管理员与普通用户两类角色，支持邀请码注册、账号分组和配置复制。
+- 支持一号、二号、三号巨构的场馆顺序、场地顺序和时段优先级设置。
+- 支持单时段尝试数、同一时段并发数、最大预约数和双时段预约。
+- 支持手机 8080、电脑 80 两套预约通道。
+- 支持按星期常驻调度，服务重启后自动恢复下一次任务。
+- 支持查场、页面直接预订、订单查询、最近三天结果和历史日志。
+- 使用 OpenCV 在本地识别滑块，无需启动独立识别服务。
+
+## 项目结构
 
 ```text
-badminton_book_system/
+Badminton_booking_system_for_XJTU/
 ├── web_platform/
-│   ├── main.py            # FastAPI entrypoint, port 8000
-│   ├── booking_engine.py  # booking workflow
-│   ├── scheduler.py       # scheduled jobs
-│   ├── database.py        # SQLite access
-│   ├── static/index.html  # Web UI
-│   └── bookings.db        # local account/task data
-├── cas_http/
-│   ├── booking_api.py     # booking-site HTTP API helpers
-│   └── cas_login.py       # CAS login
-└── slider_match/
-    ├── run_slider_match.py
-    └── slider_server.py   # optional standalone Flask debug service
+│   ├── main.py                 # FastAPI、REST API、WebSocket
+│   ├── booking_engine.py       # 核心预约流程
+│   ├── scheduler.py            # 定时任务与预约前流水线
+│   ├── database.py             # SQLite 数据访问
+│   ├── dual_slot.py            # 双时段与优先级逻辑
+│   ├── log_manager.py          # 实时及历史日志
+│   └── static/index.html       # Vue 3 Web UI
+├── cas_http/                   # CAS 登录与场馆 HTTP API
+├── slider_match/               # OpenCV 滑块匹配
+├── booking-dashboard.png       # 预约管理主界面截图
+├── preference-settings.png     # 场馆偏好与双时段截图
+└── README.md
 ```
 
-## Start
+## 快速开始
 
-Run:
+环境要求：Windows 10/11、Python 3.10+，并能访问西安交大 CAS 与场馆服务。
+
+在项目根目录执行：
 
 ```bat
 web_platform\start.bat
 ```
 
-Then open:
+脚本会安装依赖并启动 8000 端口，随后访问：
 
 ```text
 http://localhost:8000
 ```
 
-The Web backend calls `slider_match/run_slider_match.py` directly. Deprecated mailbox-based secondary-code automation has been removed.
+也可以手动启动：
 
-## Runtime Dependencies
+```powershell
+cd web_platform
+python -m pip install -r requirements.txt
+python main.py
+```
 
-Install via `web_platform/requirements.txt`:
+程序默认管理员账号和密码均为 `admin`。首次启动前建议修改：
 
-- fastapi
-- uvicorn
-- aiosqlite
-- apscheduler
-- httpx
-- cryptography
-- opencv-python
-- numpy
+```powershell
+$env:BOOKING_ADMIN_USERNAME = "your-admin-name"
+$env:BOOKING_ADMIN_PASSWORD = "use-a-strong-password"
+cd web_platform
+python main.py
+```
 
+页面从 `unpkg.com` 加载 Vue 3；如果页面空白，请先检查浏览器能否访问该 CDN。
+
+## 使用流程
+
+1. 管理员登录后直接添加账号，或生成一次性邀请码供普通用户注册。
+2. 在“账号”页测试 CAS 登录，并选择手机 8080 或电脑 80 通道。
+3. 设置目标日期、场馆和场地顺序、时段、尝试数与并发数。
+4. 设置执行时间和生效星期，启用常驻调度或点击“定时启动”。
+5. 通过实时日志观察执行过程，并在“我的订单”中核对最终结果。
+
+关键配置：
+
+| 配置项 | 含义 |
+| --- | --- |
+| 目标日期 | 相对今天的天数；自动预约当前只使用所选列表第一项，默认两天后。 |
+| 场馆/场地顺序 | 数值越小越优先，候选按场馆优先级再按馆内场地优先级排序。 |
+| 时段优先级 | 范围 1～5，较小优先级先执行，同级时段并行。 |
+| 尝试数 | 一个时段最多尝试的候选场地数，范围 0～10。 |
+| 场并 | 同一时段同时处理的候选数，范围 1～10；下单区段仍受账号级锁保护。 |
+| 双时段 | 只配对连续两个时段中同一场馆、同一场地号，并在一个订单中提交。 |
+| 提前查询 | 在正式预约前多少毫秒开始查场，界面范围 0～5000 ms。 |
+| 预约通道 | 登录、查场、滑块和下单均走所选通道；切换后需要重新登录。 |
+
+![场馆偏好与双时段设置](./preference-settings.png)
+
+## 关键设计
+
+### 预约前流水线
+
+系统将耗时步骤前移，缩短正式预约时刻的关键路径：
+
+```text
+T-60s    检查会话，失效时执行 CAS 登录
+T-6s     匿名并发获取并识别 6 份滑块验证码
+T-Xms    匿名查场，并按 1 秒节拍继续轮询，最多 20 轮
+T-2s     通过订单接口最终检查登录会话
+T=0      使用准备好的会话、最新候选和验证码提交预约
+```
+
+`X` 由“提前查询”控制。`T=0` 不重新登录；会话终检失败时直接中止，候选或验证码缺失时则使用现场查询与实时识别降级。
+
+### 会话与查询隔离
+
+每套配置拥有独立运行时状态。认证后的 `httpx.Client` 只用于订单与下单；高频查场和验证码请求使用匿名客户端池，避免争用认证会话。切换 8080/80 通道时会主动清除旧会话。
+
+### 候选快照乱序保护
+
+并发查场可能出现“先请求、后返回”。系统按请求开始时间更新候选快照，较旧查询不能覆盖较新结果；新任务还会设置截止时间，阻止上一轮未完成的请求写入。若某轮所有场馆均失败，则保留上一份可用快照。
+
+### 优先级、递补与双时段
+
+时段按优先级分波次执行，同一波次中的任务并行。每个时段最多保留指定数量的并发尝试，失败后从最新快照中按场馆、场地顺序递补，直到成功、达到尝试数或触发官方限制。
+
+双时段先计算两个连续时段的候选交集，只保留同馆同场的组合。被双时段占用的时间不会再走单时段路径，避免同一配置产生冲突订单。
+
+### 滑块与日志
+
+滑块图片在内存中完成 Base64 解码、OpenCV 模板匹配和坐标换算。预取结果有效期为 20 秒，每个验证码只消费一次；预取失效或识别失败时会切换到实时获取。
+
+工作线程将日志写入线程安全队列，再由异步任务推送到 WebSocket。每套配置内存中保留最近 500 条日志，完整记录保存在：
+
+```text
+web_platform/logs/profile_<profile_id>_<时间>.log
+```
+
+## 数据与调度
+
+本地数据库为 `web_platform/bookings.db`，保存账号配置、邀请码和按日期记录的预约结果；认证会话、验证码、候选快照和具体调度任务只保存在内存中。
+
+服务启动时会根据数据库中的启用状态、星期和执行时间重新计算下一次任务。服务停止期间错过的任务不会补执行。
+
+## 安全说明与限制
+
+- CAS 凭据当前以明文保存在本地 SQLite 中，请勿上传 `bookings.db` 或将服务暴露给不可信网络。
+- 默认管理员密码为 `admin`，部署前必须修改。
+- 登录 Token 保存在进程内存，重启后失效；当前 WebSocket 端点尚未校验 Token。
+- 后端默认监听 `0.0.0.0`，不建议直接部署到公网。如需远程使用，应增加 HTTPS、鉴权、凭据加密和限流。
+- CAS 要求邮箱验证码等二次认证时，自动登录会失败；项目已移除二次验证码自动化。
+- `schedule_mode` 当前仅作为兼容字段保存，核心流程尚未按 `api` / `mix` 分支执行。
+- 官方接口、开放时间或认证流程变化时，需结合历史日志和官方页面排查。
+
+## 测试
+
+```powershell
+cd web_platform
+python -m unittest -v test_dual_slot.py
+```
+
+当前测试覆盖双时段配对、优先级波次、订单参数、订单详情和查询快照乱序保护。
