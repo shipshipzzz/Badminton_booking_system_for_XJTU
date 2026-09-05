@@ -50,8 +50,10 @@ def start_log_session(profile_id: int):
 def emit(profile_id: int, msg: str, status: str = None):
     """Called from any thread (including booking threads). Thread-safe.
     Also persists to log file for post-analysis."""
-    ts = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
-    entry = {"ts": ts, "msg": msg}
+    now = time.time()
+    ts = time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now * 1000) % 1000:03d}"
+    # "t" is the epoch time; the UI uses it to hide entries older than a client-side clear point.
+    entry = {"ts": ts, "t": round(now, 6), "msg": msg}
     if status:
         entry["status"] = status
     _log_queue.put((profile_id, entry))

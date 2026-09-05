@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 import httpx
 
 from site_config import get_channel
+from http_capture import record_request
 
 
 AJAX_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
@@ -28,11 +29,18 @@ def _headers(cfg):
 
 
 def _get_with_retry(client, url, headers=None, retries=4, delay=0.35):
-    """Official site often returns empty HTTP 500; retry before giving up."""
+    """Official site often returns empty HTTP 500; retry before giving up.
+
+    A redirect (e.g. the :8080 channel sending anonymous queries to errorpage.html
+    outside 08:40-21:40) is deterministic, so it is returned at once without retrying.
+    """
     last = None
     for attempt in range(retries):
-        last = client.get(url, headers=headers or AJAX_HEADERS, timeout=10)
+        last = record_request(client, "GET", url, capture_meta={"attempt": attempt + 1},
+                              headers=headers or AJAX_HEADERS, timeout=10)
         if last.status_code == 200 and last.content:
+            return last
+        if 300 <= last.status_code < 400:
             return last
         time.sleep(delay * (attempt + 1))
     return last
@@ -183,8 +191,8 @@ def query_seats(client, venue_id, stock_id, date=None, channel=None):
 
 def fetch_captcha(client, channel=None):
     cfg = _cfg(channel, client)
-    resp = client.get(f"{cfg.captcha_url}?_={int(time.time()*1000)}",
-                      headers=_headers(cfg), timeout=10)
+    resp = record_request(client, "GET", f"{cfg.captcha_url}?_={int(time.time()*1000)}",
+                          headers=_headers(cfg), timeout=10)
     data = resp.json()
     captcha_id = data.get("id")
     bg = data.get("captcha", {}).get("backgroundImage")
@@ -328,7 +336,7 @@ def submit_order(client, venue_id, stock_id=None, seat_id=None, channel=None, it
     cfg = _cfg(channel, client)
     param = _order_param(venue_id, _as_order_items(stock_id, seat_id, items), for_booking=False)
     data = urlencode({"param": json.dumps(param)})
-    resp = client.post(
+    resp = record_request(client, "POST",
         cfg.api_url(f"/order/show.html?id={venue_id}"),
         content=data,
         headers={
@@ -347,7 +355,7 @@ def submit_booking(client, venue_id, stock_id=None, seat_id=None, yzm_data=None,
     cfg = _cfg(channel, client)
     param = _order_param(venue_id, _as_order_items(stock_id, seat_id, items), for_booking=True)
     body = f"param={httpx.URL('?' + urlencode({'p': json.dumps(param)})).params['p']}&yzm={httpx.URL('?' + urlencode({'y': yzm_data})).params['y']}&json=true"
-    resp = client.post(
+    resp = record_request(client, "POST",
         cfg.api_url(cfg.book_path),
         content=body,
         headers={

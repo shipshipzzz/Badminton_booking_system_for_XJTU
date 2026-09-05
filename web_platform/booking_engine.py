@@ -2,10 +2,11 @@
 Core booking logic: wraps cas_login + booking_api for per-profile execution.
 
 Timeline:
-  T-60s   Login (prepare authenticated session)
+  T-12h   Fill the candidate pool (selected courts -> server stock/seat IDs)
+  T-150s  Login check, repeated every 60s (T-90s, T-30s); re-login if invalid
   T-6s    Prefetch captchas (store for use at T=0)
-  T-Xms   Start querying courts (anonymous, no session, every 1s, max 20 updates)
-  T=0     Book using stored captchas + latest court list
+  T-Xms   Live court query (anonymous, every 1s, max 20 updates) refines the pool
+  T=0     Book from the candidate pool immediately; no blocking query
 """
 
 import base64
@@ -44,6 +45,7 @@ from booking_api import (  # noqa: E402
 import httpx  # noqa: E402
 import log_manager  # noqa: E402
 from site_config import get_channel, normalize_channel  # noqa: E402
+from http_capture import capture_context, submit_with_capture_context
 from dual_slot import (  # noqa: E402
     collect_priority_levels,
     collect_query_slot_times,
@@ -52,6 +54,16 @@ from dual_slot import (  # noqa: E402
     get_dual_slot_prefs,
     pick_dual_pairs,
     tasks_for_wave,
+)
+from candidate_pool import (  # noqa: E402
+    CandidatePool,
+    bookable_entries,
+    bookable_signature,
+    describe_slots,
+    find_matching_slot as _find_matching_slot,
+    merge_venue_results,
+    pool_summary,
+    rebuild_pool,
 )
 
 VENUES = [
@@ -91,16 +103,16 @@ class ProfileRuntime:
     task: object = None                          # asyncio.Task
     query_task: object = None                    # continuous query task
     cancel_event: threading.Event = field(default_factory=threading.Event)
-    cached_candidates: dict = field(default_factory=dict)   # Latest court availability
+    pool: CandidatePool | None = None            # Candidate pool for the target date
+    pool_log_signature: tuple = ()               # Last logged bookable composition
+    target_at: datetime | None = None            # Scheduled T (None when not scheduled)
     prefetched_captchas: list = field(default_factory=list)  # Pre-fetched captchas
     captcha_lock: threading.Lock = field(default_factory=threading.Lock)
     prefetch_lock: threading.Lock = field(default_factory=threading.Lock)
     book_lock: threading.Lock = field(default_factory=threading.Lock)
     candidates_lock: threading.Lock = field(default_factory=threading.Lock)
+    login_lock: threading.Lock = field(default_factory=threading.Lock)
     query_seq: int = 0
-    applied_query_seq: int = 0
-    applied_query_started_at: float = 0.0
-    query_cutoff_at: float = 0.0
     continuous_query_running: bool = False
     session_ready: bool = False
     session_ready_reason: str = "not checked"
@@ -124,52 +136,24 @@ def build_latest_booking_result(booked_courts: list[dict]) -> str:
     return "\n".join(lines) if lines else "未抢到场地"
 
 
-def get_target_booking_date(profile: dict) -> str:
-    target_days = profile.get("target_days", [2])
-    offset = target_days[0] if target_days else 2
-    return (datetime.now() + timedelta(days=offset)).strftime("%Y-%m-%d")
+def _target_day_offset(profile: dict) -> int:
+    target_days = profile.get("target_days") or [2]
+    try:
+        return int(target_days[0])
+    except (TypeError, ValueError, IndexError):
+        return 2
 
 
-def build_booking_flow_result(profile: dict, booked_courts: list[dict] | None = None,
-                              persist: bool = True) -> dict:
-    booked_courts = booked_courts or []
-    return {
-        "persist_latest_result": persist,
-        "latest_booking_result": build_latest_booking_result(booked_courts) if persist else "",
-        "booking_date": get_target_booking_date(profile),
-    }
+def get_target_booking_date(profile: dict, base: datetime | None = None) -> str:
+    """Booking date = base day + target offset. Base defaults to now."""
+    base = base or datetime.now()
+    return (base + timedelta(days=_target_day_offset(profile))).strftime("%Y-%m-%d")
 
 
-def _slot_start_minutes(time_slot: str) -> int | None:
-    match = re.match(r"^\s*(\d{1,2}):(\d{2})\s*-", str(time_slot or ""))
-    if not match:
-        return None
-    hour, minute = int(match.group(1)), int(match.group(2))
-    return hour * 60 + minute
-
-
-def _find_matching_slot(times: list[dict], preferred_time: str) -> dict | None:
-    exact = next((t for t in times if t.get("TIME_NO") == preferred_time), None)
-    if exact:
-        return exact
-
-    preferred_start = _slot_start_minutes(preferred_time)
-    if preferred_start is None:
-        return None
-
-    same_hour_candidates = []
-    for slot in times:
-        slot_start = _slot_start_minutes(slot.get("TIME_NO", ""))
-        if slot_start is None:
-            continue
-        diff = abs(slot_start - preferred_start)
-        if diff <= 45 and slot_start // 60 == preferred_start // 60:
-            same_hour_candidates.append((diff, slot_start, slot))
-
-    if not same_hour_candidates:
-        return None
-    same_hour_candidates.sort(key=lambda item: (item[0], item[1]))
-    return same_hour_candidates[0][2]
+def target_booking_date(profile: dict, rt: "ProfileRuntime | None" = None) -> str:
+    """Booking date relative to the scheduled T when one is pending, else to now."""
+    base = rt.target_at if rt is not None and rt.target_at else None
+    return get_target_booking_date(profile, base)
 
 
 _runtimes: dict[int, ProfileRuntime] = {}
@@ -233,14 +217,27 @@ def get_runtime(profile_id: int) -> ProfileRuntime:
     return _runtimes[profile_id]
 
 
-def reset_query_snapshot(rt: ProfileRuntime) -> None:
-    """Clear the live snapshot. In-flight queries started before this cutoff cannot apply."""
+def ensure_pool(rt: ProfileRuntime, profile: dict, date: str) -> CandidatePool:
+    """Make sure rt.pool covers `date` and the current selection. Keeps known IDs."""
+    slot_times = collect_query_slot_times(profile)
     with rt.candidates_lock:
-        rt.cached_candidates = {}
-        rt.query_seq = 0
-        rt.applied_query_seq = 0
-        rt.applied_query_started_at = 0.0
-        rt.query_cutoff_at = time.time()
+        rt.pool = rebuild_pool(rt.pool, profile, date, slot_times)
+        return rt.pool
+
+
+def rebuild_pool_for_profile(rt: ProfileRuntime, profile: dict, date: str) -> dict | None:
+    """Rebuild the default pool after a selection change. Returns the summary."""
+    ensure_pool(rt, profile, date)
+    with rt.candidates_lock:
+        return pool_summary(rt.pool)
+
+
+def pool_status(profile_id: int) -> dict | None:
+    rt = _runtimes.get(profile_id)
+    if rt is None:
+        return None
+    with rt.candidates_lock:
+        return pool_summary(rt.pool)
 
 
 def begin_query_seq(rt: ProfileRuntime) -> tuple[int, float]:
@@ -249,27 +246,10 @@ def begin_query_seq(rt: ProfileRuntime) -> tuple[int, float]:
         return rt.query_seq, time.time()
 
 
-def apply_query_candidates(rt: ProfileRuntime, seq: int, candidates: dict,
-                           started_at: float | None = None) -> bool:
-    """Keep the snapshot from the latest-started query. An earlier query can still
-    fill an empty/older snapshot if nothing newer has applied yet."""
-    with rt.candidates_lock:
-        if started_at is None:
-            started_at = time.time()
-        if started_at < rt.query_cutoff_at:
-            return False
-        applied_at = rt.applied_query_started_at
-        if started_at < applied_at or (started_at == applied_at and seq < rt.applied_query_seq):
-            return False
-        rt.applied_query_seq = seq
-        rt.applied_query_started_at = started_at
-        rt.cached_candidates = candidates
-        return True
-
-
 def copy_slot_candidates(rt: ProfileRuntime, *slot_times: str) -> list[list]:
+    """Bookable candidates (IDs known, explicitly available) per slot, priority order."""
     with rt.candidates_lock:
-        return [list(rt.cached_candidates.get(time_str, [])) for time_str in slot_times]
+        return [bookable_entries(rt.pool, time_str) for time_str in slot_times]
 
 
 def remove_runtime(profile_id: int):
@@ -513,7 +493,7 @@ def do_login(profile_id: int, username: str, password: str, channel: str | None 
                 return False
 
         rt.client = client
-        mark_session_ready(rt, False, "awaiting T-2s validation")
+        mark_session_ready(rt, session_valid, f"login ok ({session_reason})")
         log(f"[Login] CAS login successful ({session_reason})")
         return True
     except CASLoginError as e:
@@ -596,47 +576,61 @@ def do_prefetch_captchas(profile_id: int, count: int = 6) -> list:
 
 # ==================== Step 3: Query Courts (Anonymous, T-Xms) ====================
 
-def do_query_candidates(profile_id: int, profile: dict, seq: int | None = None,
-                        started_at: float | None = None) -> dict:
+def _alternate_channel(channel: str) -> str:
+    return "80" if normalize_channel(channel) == "8080" else "8080"
+
+
+def _fetch_venue_inventory(venue_prefs: list[dict], slot_times: list[str], date: str,
+                           channel: str, log) -> tuple[dict[int, dict], dict]:
+    """Fetch inventory on the profile's channel, then retry failed venues on the other one.
+
+    Stock/seat IDs are identical on both channels, and the :8080 H5 channel rejects
+    anonymous queries outside 08:40-21:40 while the :80 portal answers all day.
     """
-    Query available courts using ANONYMOUS clients in parallel.
-    This avoids session contention with the booking requests.
-    Always fetches live occupancy. The snapshot is applied by request-start
-    time so a slower earlier query cannot overwrite a later one, but can still
-    fill the snapshot if nothing newer has arrived.
-    Returns {timeSlot: [candidates sorted by priority]}
+    results, timing = _fetch_venue_inventory_on(venue_prefs, slot_times, date, channel, log)
+    failed = [vp for vp in venue_prefs if not results.get(vp["id"], {}).get("ok")]
+    if not failed:
+        return results, timing
+
+    alt = _alternate_channel(channel)
+    alt_results, alt_timing = _fetch_venue_inventory_on(failed, slot_times, date, alt, log)
+    recovered = []
+    for vp in failed:
+        if alt_results.get(vp["id"], {}).get("ok"):
+            results[vp["id"]] = alt_results[vp["id"]]
+            recovered.append(vp["name"])
+    timing["ok"] = sum(1 for r in results.values() if r.get("ok"))
+    timing["failed"] = len(results) - timing["ok"]
+    for key in ("times_ms", "seats_ms", "total_ms"):
+        timing[key] += alt_timing[key]
+    timing["fallback"] = f"{len(recovered)}/{len(failed)} via {alt}"
+    log(
+        f"[Query] {', '.join(vp['name'] for vp in failed)} failed on {channel}, "
+        f"retried on {alt}: recovered {', '.join(recovered) or 'none'}"
+    )
+    return results, timing
+
+
+def _fetch_venue_inventory_on(venue_prefs: list[dict], slot_times: list[str], date: str,
+                              channel: str, log) -> tuple[dict[int, dict], dict]:
+    """Fetch times + seats for every venue on one channel with anonymous clients.
+
+    Returns ({venue_id: {"ok", "times", "seats_by_stock"}}, timing). A venue whose
+    times fetch failed is reported ok=False; a slot whose seat fetch failed is
+    reported as seats_by_stock[stock_id] = None so the pool keeps its last state.
     """
-    log = lambda msg: log_manager.emit(profile_id, msg)
-
-    venue_prefs = [v for v in profile.get("venue_prefs", []) if v.get("enabled")]
-    slot_times = collect_query_slot_times(profile)
-    date = get_target_booking_date(profile)
-    rt = get_runtime(profile_id)
-    channel = profile_channel(profile, rt)
-    rt.channel = channel
-    if seq is None or started_at is None:
-        seq, started_at = begin_query_seq(rt)
-
-    if not venue_prefs or not slot_times:
-        apply_query_candidates(rt, seq, {}, started_at)
-        return {}
-
-    venue_rank = {vp["id"]: i + 1 for i, vp in enumerate(venue_prefs)}
-
-    results = {time_str: [] for time_str in slot_times}
-    total_started = time.perf_counter()
     seat_mode = get_channel(channel).seat_mode
+    results: dict[int, dict] = {}
+    timing = {"ok": 0, "failed": 0}
+    total_started = time.perf_counter()
 
     stage1_started = time.perf_counter()
-    venue_times_map: dict[int, list] = {}
     venue_rows_map: dict[int, list] = {}
-    fetch_ok = 0
-    fetch_failed = 0
-    venue_workers = min(QUERY_MAX_WORKERS, len(venue_prefs))
+    venue_workers = min(QUERY_MAX_WORKERS, max(1, len(venue_prefs)))
     with ThreadPoolExecutor(max_workers=venue_workers) as executor:
         if seat_mode == "ok_area":
             future_to_venue = {
-                executor.submit(query_ok_area_anonymous, vp["id"], date, channel): vp
+                submit_with_capture_context(executor, query_ok_area_anonymous, vp["id"], date, channel): vp
                 for vp in venue_prefs
             }
             for future in future_to_venue:
@@ -647,127 +641,147 @@ def do_query_candidates(profile_id: int, profile: dict, seq: int | None = None,
                     rows = None
                     log(f"[Query] {vp['name']} times failed: {e}")
                 if rows is None:
-                    fetch_failed += 1
-                    venue_rows_map[vp["id"]] = []
-                    venue_times_map[vp["id"]] = []
+                    timing["failed"] += 1
+                    results[vp["id"]] = {"ok": False}
                     continue
-                fetch_ok += 1
+                timing["ok"] += 1
                 venue_rows_map[vp["id"]] = rows
-                venue_times_map[vp["id"]] = _times_from_ok_area(rows)
+                results[vp["id"]] = {"ok": True, "times": _times_from_ok_area(rows), "seats_by_stock": {}}
         else:
             future_to_venue = {
-                executor.submit(query_times_anonymous, vp["id"], date, channel): vp
+                submit_with_capture_context(executor, query_times_anonymous, vp["id"], date, channel): vp
                 for vp in venue_prefs
             }
             for future in future_to_venue:
                 vp = future_to_venue[future]
                 try:
-                    venue_times_map[vp["id"]] = future.result()
-                    fetch_ok += 1
+                    times = future.result()
+                    timing["ok"] += 1
+                    results[vp["id"]] = {"ok": True, "times": times, "seats_by_stock": {}}
                 except Exception as e:
-                    venue_times_map[vp["id"]] = []
-                    fetch_failed += 1
+                    timing["failed"] += 1
+                    results[vp["id"]] = {"ok": False}
                     log(f"[Query] {vp['name']} times failed: {e}")
 
     seat_jobs = []
-    for time_str in slot_times:
-        for vp in venue_prefs:
-            times = venue_times_map.get(vp["id"], [])
-            slot = _find_matching_slot(times, time_str)
+    for vp in venue_prefs:
+        result = results.get(vp["id"])
+        if not result or not result["ok"]:
+            continue
+        for time_str in slot_times:
+            slot = _find_matching_slot(result["times"], time_str)
             if slot:
-                seat_jobs.append((time_str, vp, slot))
+                seat_jobs.append((vp, slot))
 
     stage2_started = time.perf_counter()
     if seat_jobs:
         if seat_mode == "ok_area":
-            for time_str, vp, slot in seat_jobs:
-                seats = seats_from_ok_area(venue_rows_map.get(vp["id"], []), slot["ID"])
-                _append_seat_candidates(
-                    results, time_str, vp, slot, seats, date, venue_rank.get(vp["id"], 1)
+            for vp, slot in seat_jobs:
+                results[vp["id"]]["seats_by_stock"][str(slot["ID"])] = seats_from_ok_area(
+                    venue_rows_map.get(vp["id"], []), slot["ID"]
                 )
         else:
             seat_workers = min(QUERY_MAX_WORKERS, len(seat_jobs))
             with ThreadPoolExecutor(max_workers=seat_workers) as executor:
                 future_to_job = {
-                    executor.submit(query_seats_anonymous, vp["id"], slot["ID"], date, channel): (time_str, vp, slot)
-                    for time_str, vp, slot in seat_jobs
+                    submit_with_capture_context(executor, query_seats_anonymous, vp["id"], slot["ID"], date, channel): (vp, slot)
+                    for vp, slot in seat_jobs
                 }
                 for future in future_to_job:
-                    time_str, vp, slot = future_to_job[future]
+                    vp, slot = future_to_job[future]
                     try:
                         seats = future.result()
                     except Exception as e:
                         log(f"[Query] {vp['name']} seats failed: {e}")
-                        continue
-                    _append_seat_candidates(
-                        results, time_str, vp, slot, seats, date, venue_rank.get(vp["id"], 1)
-                    )
+                        seats = None
+                    results[vp["id"]]["seats_by_stock"][str(slot["ID"])] = seats
 
-    for time_no in results:
-        results[time_no].sort(key=lambda c: (
-            c.get("venuePriority", 99),
-            c.get("priority", 99),
-            c.get("venueId", 0),
-            c["court"]["courtNumber"],
-        ))
+    finished = time.perf_counter()
+    timing["times_ms"] = (stage2_started - stage1_started) * 1000
+    timing["seats_ms"] = (finished - stage2_started) * 1000
+    timing["total_ms"] = (finished - total_started) * 1000
+    return results, timing
 
-    total = sum(len(v) for v in results.values())
-    active_slots = [k for k, v in results.items() if v]
-    total_ms = (time.perf_counter() - total_started) * 1000
-    stage1_ms = (stage2_started - stage1_started) * 1000
-    stage2_ms = (time.perf_counter() - stage2_started) * 1000
-    if fetch_ok == 0 and fetch_failed > 0:
-        log(
-            f"[Query] #{seq} {date}: all venues failed "
-            f"(times:{stage1_ms:.0f}ms seats:{stage2_ms:.0f}ms total:{total_ms:.0f}ms), keep previous snapshot"
-        )
-        return results
-    applied = apply_query_candidates(rt, seq, results, started_at)
-    stale = "" if applied else " stale-discarded"
-    log(
-        f"[Query] #{seq} {date}: {total} candidates in {len(active_slots)} slots "
-        f"(times:{stage1_ms:.0f}ms seats:{stage2_ms:.0f}ms total:{total_ms:.0f}ms){stale}"
+
+def do_query_candidates(profile_id: int, profile: dict, seq: int | None = None,
+                        started_at: float | None = None, source: str = "live",
+                        date: str | None = None) -> dict:
+    """
+    Query the target date's inventory with ANONYMOUS clients and merge it into
+    the candidate pool. A venue that fails keeps its last known state; results
+    are applied per venue by request-start time so a slow earlier query cannot
+    overwrite a newer one. Returns the merge stats (empty dict when nothing ran).
+    """
+    log = lambda msg: log_manager.emit(profile_id, msg)
+
+    rt = get_runtime(profile_id)
+    channel = profile_channel(profile, rt)
+    rt.channel = channel
+    if date is None:
+        date = target_booking_date(profile, rt if source != "manual" else None)
+
+    # Pool first, then the start stamp: a request stamped before the pool cutoff is stale.
+    pool = ensure_pool(rt, profile, date)
+    if seq is None or started_at is None:
+        seq, started_at = begin_query_seq(rt)
+    venue_prefs = [v for v in profile.get("venue_prefs", []) if v.get("enabled")]
+    slot_times = pool.slot_times
+    tag = f"[Query] #{seq} ({source}) {date}"
+
+    if not venue_prefs or not slot_times:
+        log(f"{tag}: nothing selected (venues={len(venue_prefs)}, slots={len(slot_times)})")
+        return {}
+
+    with capture_context(profile_id=profile_id, query_seq=seq, source=source, booking_date=date):
+        venue_results, timing = _fetch_venue_inventory(venue_prefs, slot_times, date, channel, log)
+    timing_text = (
+        f"times:{timing['times_ms']:.0f}ms seats:{timing['seats_ms']:.0f}ms total:{timing['total_ms']:.0f}ms"
     )
-    for slot_time in active_slots:
-        courts = results[slot_time]
-        court_list = ", ".join(
-            f"{c['venueName']} 场地{c['court']['courtNumber']}(馆{c.get('venuePriority', '?')}/场{c.get('priority', '?')})"
-            for c in courts
-        )
-        log(f"[Query]   {slot_time}: {court_list}")
-    return results
 
+    with rt.candidates_lock:
+        if rt.pool is None or rt.pool.date != date:
+            log(f"{tag}: pool now targets {rt.pool.date if rt.pool else 'nothing'}, result discarded ({timing_text})")
+            return {}
+        summary_before = pool_summary(rt.pool)
+        if timing["ok"] == 0:
+            log(
+                f"{tag}: all venues failed ({timing_text}), keeping pool "
+                f"({summary_before['bookable']} bookable, last ok {summary_before['last_success_at'] or 'never'})"
+            )
+            return {"applied": [], "failed": list(venue_results)}
+        stats = merge_venue_results(rt.pool, venue_results, started_at, seq=seq, source=source,
+                                    venue_prefs=venue_prefs)
+        summary = pool_summary(rt.pool)
+        signature = bookable_signature(rt.pool)
+        composition_changed = signature != rt.pool_log_signature
+        rt.pool_log_signature = signature
+        slot_lines = describe_slots(rt.pool)
 
-def _append_seat_candidates(results: dict, time_str: str, vp: dict, slot: dict,
-                            seats: list, date: str, fallback_venue_pri: int = 1) -> None:
-    allowed = set(vp.get("courts", []))
-    court_priority = vp.get("courtPriority", {})
-    raw = vp.get("priority")
-    try:
-        venue_pri = fallback_venue_pri if raw is None or raw == "" else int(raw)
-    except (TypeError, ValueError):
-        venue_pri = fallback_venue_pri
-    venue_pri = max(1, min(venue_pri, 5))
-    for seat in seats:
-        if not seat["available"]:
-            continue
-        if allowed and seat["courtNumber"] not in allowed:
-            continue
-        pri = court_priority.get(str(seat["courtNumber"]), seat["courtNumber"])
-        results[time_str].append({
-            "venueId": vp["id"],
-            "venueName": vp["name"],
-            "venuePriority": venue_pri,
-            "date": date,
-            "timeSlot": slot.get("TIME_NO", time_str),
-            "stockId": slot["ID"],
-            "court": {
-                "courtNumber": seat["courtNumber"],
-                "courtName": f"场地{seat['courtNumber']}",
-                "seatId": seat["seatId"],
-            },
-            "priority": pri,
-        })
+    names = {vp["id"]: vp["name"] for vp in venue_prefs}
+    parts = [f"venues ok={timing['ok']} failed={timing['failed']}"]
+    if timing.get("fallback"):
+        parts.append(f"fallback {timing['fallback']}")
+    if stats["stale"]:
+        parts.append("stale-discarded: " + ", ".join(names.get(v, str(v)) for v in stats["stale"]))
+    log(f"{tag}: {' | '.join(parts)} ({timing_text})")
+    log(
+        f"[Pool] {date}: {summary['bookable']} bookable / {summary['selected']} selected "
+        f"in {sum(1 for n in summary['slots'].values() if n)} slots, "
+        f"{summary['unresolved']} unresolved, {summary['unavailable']} unavailable"
+        + (f" | +{stats['resolved']} resolved" if stats["resolved"] else "")
+    )
+    if stats["removed"]:
+        log("[Pool] removed (not bookable): " + ", ".join(stats["removed"]))
+    if stats["restored"]:
+        log("[Pool] back to bookable: " + ", ".join(stats["restored"]))
+    if stats["added"]:
+        log("[Pool] added: " + ", ".join(stats["added"]))
+    if source != "live" or composition_changed:
+        for line in slot_lines:
+            log(f"[Pool]   {line}")
+        if not slot_lines:
+            log("[Pool]   (no bookable court yet)")
+    return stats
 
 
 # ==================== Step 4: Book Single Court ====================
@@ -827,7 +841,7 @@ def do_book_courts(profile_id: int, courts: list[dict], shared: dict | None = No
                 )
 
             yzm_data = generate_yzm_data(display_x, captcha_id, rt.channel)
-            with rt.book_lock:
+            with rt.book_lock, capture_context(profile_id=profile_id, phase="booking", attempt=attempt):
                 if shared:
                     with shared["lock"]:
                         if shared["successful"] >= shared["max_bookings"] or shared["daily_limit_reached"]:
@@ -895,7 +909,7 @@ def _book_time_slot(profile_id: int, time_slot: str, fanout: int,
     Book one time slot by trying courts in priority order.
     Keeps up to `parallel` court attempts in flight and backfills with the
     next highest-priority candidate when a previous attempt fails.
-    Reads LATEST court list from rt.cached_candidates each attempt.
+    Reads the LATEST candidate pool each attempt.
     """
     log = lambda msg: log_manager.emit(profile_id, msg)
     rt = get_runtime(profile_id)
@@ -1115,13 +1129,22 @@ def _run_priority_wave(profile_id: int, duals: list[dict], singles: list[dict], 
 
 # ==================== Full Booking Flow ====================
 
-def run_booking_flow(profile_id: int, profile: dict):
+POOL_WAIT_AT_T_SECONDS = 5.0
+POOL_WAIT_POLL_SECONDS = 0.05
+
+
+def _pool_has_bookable(rt: ProfileRuntime, slot_times: list[str]) -> bool:
+    return any(copy_slot_candidates(rt, *slot_times))
+
+
+def run_booking_flow(profile_id: int, profile: dict, scheduled: bool = False):
     """
     Execute booking at T=0. Expects:
-    - rt.client already set (from T-60s login)
+    - rt.client already set (login checks at T-150s/T-90s/T-30s)
     - rt.prefetched_captchas already filled (from T-6s prefetch)
-    - rt.cached_candidates already filled (from T-Xms continuous query)
-    Falls back to doing these steps if not already done.
+    - rt.pool already filled (T-12h query, refined by the live query)
+    Scheduled runs never block on a query: they book from the pool as it is.
+    Manual runs (scheduled=False) query once before booking.
     """
     # Start a new log session for this booking run
     log_manager.start_log_session(profile_id)
@@ -1138,6 +1161,8 @@ def run_booking_flow(profile_id: int, profile: dict):
     occupied_times = dual_occupied_times(dual_prefs)
     single_prefs = filter_single_time_prefs(profile.get("time_prefs", []), occupied_times)
     max_bookings = profile.get("max_bookings", 2)
+    slot_times = collect_query_slot_times(profile)
+    booking_date = target_booking_date(profile, rt if scheduled else None)
 
     shared = {
         "successful": 0,
@@ -1147,46 +1172,64 @@ def run_booking_flow(profile_id: int, profile: dict):
         "lock": threading.Lock(),
     }
 
+    def flow_result(booked=None, persist=True):
+        return {
+            "persist_latest_result": persist,
+            "latest_booking_result": build_latest_booking_result(booked or []) if persist else "",
+            "booking_date": booking_date,
+        }
+
     try:
-        # Require a valid session prechecked at T-2s. T=0 does not re-login or re-check.
+        # Session: whatever the login checks left us with. T=0 never re-checks.
         if not rt.client:
-            log("[T=0] No valid session prepared before booking, aborting booking")
+            log("[T=0] No session available (login never succeeded), aborting booking")
             set_status("failed")
-            return build_booking_flow_result(profile, [])
-
-        if not rt.session_ready_checked_at:
-            log("[T=0] Final session check missing, aborting booking")
-            set_status("failed")
-            return build_booking_flow_result(profile, [])
-
-        if rt.session_ready:
-            log(f"[T=0] Session precheck OK ({rt.session_ready_reason})")
-        else:
-            log(f"[T=0] Session precheck failed ({rt.session_ready_reason}), aborting booking")
-            set_status("failed")
-            return build_booking_flow_result(profile, [])
+            return flow_result([])
+        checked = (
+            time.strftime("%H:%M:%S", time.localtime(rt.session_ready_checked_at))
+            if rt.session_ready_checked_at else "never"
+        )
+        state = "valid" if rt.session_ready else "unverified"
+        log(f"[T=0] Session {state} ({rt.session_ready_reason}, last check {checked})")
 
         if rt.cancel_event.is_set():
             set_status("idle")
-            return build_booking_flow_result(profile, persist=False)
+            return flow_result(persist=False)
 
-        # Fallback: Query if not already done by continuous query
-        snapshot = copy_slot_candidates(rt, *collect_query_slot_times(profile))
+        ensure_pool(rt, profile, booking_date)
+        if not scheduled:
+            log("[T=0] Manual run: querying courts before booking...")
+            do_query_candidates(profile_id, profile, source="manual", date=booking_date)
+
+        if scheduled and not _pool_has_bookable(rt, slot_times):
+            log(f"[T=0] Candidate pool has no bookable court yet, waiting up to {POOL_WAIT_AT_T_SECONDS:.0f}s for the live query...")
+            deadline = time.time() + POOL_WAIT_AT_T_SECONDS
+            while time.time() < deadline and not rt.cancel_event.is_set():
+                if _pool_has_bookable(rt, slot_times):
+                    break
+                time.sleep(POOL_WAIT_POLL_SECONDS)
+
+        snapshot = copy_slot_candidates(rt, *slot_times)
+        with rt.candidates_lock:
+            summary = pool_summary(rt.pool) or {}
         if not any(snapshot):
-            log("[T=0] No cached candidates (continuous query missed), querying now...")
-            do_query_candidates(profile_id, profile)
-            snapshot = copy_slot_candidates(rt, *collect_query_slot_times(profile))
-            if not any(snapshot):
-                log("[T=0] No available candidates found")
-                set_status("failed")
-                return build_booking_flow_result(profile, [])
+            log(
+                f"[T=0] No bookable candidates (pool {summary.get('date')}: "
+                f"{summary.get('selected', 0)} selected, {summary.get('unresolved', 0)} unresolved, "
+                f"{summary.get('unavailable', 0)} unavailable, last ok {summary.get('last_success_at') or 'never'})"
+            )
+            set_status("failed")
+            return flow_result([])
 
         total = sum(len(v) for v in snapshot)
-        log(f"[T=0] Using {total} cached candidates")
+        log(
+            f"[T=0] Using {total} bookable candidates from pool "
+            f"(last ok {summary.get('last_success_at') or '?'} via {summary.get('last_success_source') or '?'})"
+        )
 
         if rt.cancel_event.is_set():
             set_status("idle")
-            return build_booking_flow_result(profile, persist=False)
+            return flow_result(persist=False)
 
         # Fallback: Prefetch captchas if not already done at T-6s
         valid_captchas = get_valid_prefetched_captchas(rt)
@@ -1204,7 +1247,7 @@ def run_booking_flow(profile_id: int, profile: dict):
 
         if rt.cancel_event.is_set():
             set_status("idle")
-            return build_booking_flow_result(profile, persist=False)
+            return flow_result(persist=False)
 
         # Wait for booking time window (08:40-21:40) if needed
         now_dt = datetime.now()
@@ -1216,7 +1259,7 @@ def run_booking_flow(profile_id: int, profile: dict):
                 for _ in range(wait_seconds * 10):
                     if rt.cancel_event.is_set():
                         set_status("idle")
-                        return build_booking_flow_result(profile, persist=False)
+                        return flow_result(persist=False)
                     time.sleep(0.1)
 
         # ---- START BOOKING ----
@@ -1271,10 +1314,9 @@ def run_booking_flow(profile_id: int, profile: dict):
             set_status("success")
         else:
             set_status("failed")
-        return build_booking_flow_result(profile, shared["booked_courts"])
+        return flow_result(shared["booked_courts"])
 
     except Exception as e:
         log(f"Booking flow error: {e}")
         set_status("failed")
-        return build_booking_flow_result(profile, [])
-
+        return flow_result([])

@@ -126,6 +126,7 @@ class ProfileResponse(BaseModel):
     booking_channel: str = "8080"
     status: str
     next_schedule_at: Optional[str] = None
+    candidate_pool: Optional[dict] = None
     latest_booking_result: str = ""
     latest_booking_result_at: Optional[str] = None
     latest_booking_result_unread: bool = False

@@ -370,6 +370,14 @@ input:focus, select:focus { border-color:#1e88e5; }
             <div v-if="current.next_schedule_at" style="margin-top:8px;font-size:12px;color:#666">
               下次执行: {{ current.next_schedule_at }}
             </div>
+            <div v-if="current.candidate_pool" style="margin-top:4px;font-size:12px;color:#666">
+              候选池 {{ current.candidate_pool.date }}:
+              可预约 {{ current.candidate_pool.bookable }} / 已勾选 {{ current.candidate_pool.selected }}
+              <span v-if="current.candidate_pool.unresolved"> · 未获取ID {{ current.candidate_pool.unresolved }}</span>
+              <span v-if="current.candidate_pool.unavailable"> · 不可约 {{ current.candidate_pool.unavailable }}</span>
+              <span v-if="current.candidate_pool.last_success_at"> · 最近成功查询 {{ current.candidate_pool.last_success_at }} ({{ current.candidate_pool.last_success_source }})</span>
+              <span v-else style="color:#e65100"> · 尚未成功查询</span>
+            </div>
             <div class="form-row" style="gap:8px;margin-top:10px">
               <button class="btn btn-green" @click="startScheduled" :disabled="currentStatus==='running' || currentStatus==='waiting'">定时启动</button>
               <button class="btn btn-purple" @click="startImmediate" :disabled="currentStatus==='running' || currentStatus==='waiting'">立即抢票</button>
@@ -990,7 +998,7 @@ createApp({
 
     // ---- API ----
     const RUNTIME_FIELDS = [
-      'status', 'next_schedule_at',
+      'status', 'next_schedule_at', 'candidate_pool',
       'latest_booking_result', 'latest_booking_result_at', 'latest_booking_result_unread',
       'updated_at'
     ]
@@ -1107,6 +1115,7 @@ createApp({
       if (!current.value || !currentId.value) return
       const body = { ...current.value }
       delete body.id; delete body.created_at; delete body.updated_at; delete body.status; delete body.next_schedule_at
+      delete body.candidate_pool
       delete body.latest_booking_result; delete body.latest_booking_result_at; delete body.latest_booking_result_unread
       const data = await apiJson(`/api/profiles/${currentId.value}`, {
         method: 'PUT',
@@ -1416,7 +1425,13 @@ createApp({
       syncCourtPriorities(v)
       saveProfile()
     }
-    function clearLogs() { logs.value = []; selectedLogDate.value = ''; historyLogContent.value = '' }
+    function clearLogs() {
+      const newest = logs.value.reduce((max, entry) => Math.max(max, Number(entry.t) || 0), 0)
+      if (currentId.value && newest > 0) {
+        wsClearMark = saveLogClearMark(currentId.value, newest)
+      }
+      logs.value = []; selectedLogDate.value = ''; historyLogContent.value = ''
+    }
 
     // Computed: show realtime logs or history content
     const displayLogs = computed(() => {
@@ -1496,13 +1511,31 @@ createApp({
 
     // ---- WebSocket ----
     let wsProfileId = null
+    // Client-side clear point per profile: the server keeps its buffer and log files,
+    // the browser just stops showing entries at or before the point where "清空" was clicked.
+    const LOG_CLEAR_STORAGE_KEY = 'log_clear_marks'
+    let wsClearMark = 0
+    function loadLogClearMarks() {
+      try { return JSON.parse(localStorage.getItem(LOG_CLEAR_STORAGE_KEY) || '{}') } catch { return {} }
+    }
+    function logClearMark(profileId) {
+      return Number(loadLogClearMarks()[profileId]) || 0
+    }
+    function saveLogClearMark(profileId, t) {
+      const marks = loadLogClearMarks()
+      marks[profileId] = Math.max(t, Number(marks[profileId]) || 0)
+      localStorage.setItem(LOG_CLEAR_STORAGE_KEY, JSON.stringify(marks))
+      return marks[profileId]
+    }
     function connectWs(profileId) {
       disconnectWs()
       wsProfileId = profileId
+      wsClearMark = logClearMark(profileId)
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
       ws = new WebSocket(`${proto}//${location.host}/ws/logs/${profileId}`)
       ws.onmessage = (e) => {
         const entry = JSON.parse(e.data)
+        if (Number(entry.t) > 0 && Number(entry.t) <= wsClearMark) return
         logs.value.push(entry)
         if (logs.value.length > 500) logs.value.splice(0, logs.value.length - 500)
         nextTick(() => {

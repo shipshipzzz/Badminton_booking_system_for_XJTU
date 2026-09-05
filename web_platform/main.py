@@ -23,6 +23,7 @@ import booking_engine
 import scheduler
 from pydantic import BaseModel
 from models import ProfileCreate, ProfileUpdate, ProfileSummary, ProfileResponse, StartRequest
+from http_capture import close_capture
 
 
 # ==================== Auth ====================
@@ -76,6 +77,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     scheduler.stop()
+    await asyncio.to_thread(close_capture)
 
 
 app = FastAPI(title="Badminton Booking Manager", lifespan=lifespan)
@@ -147,6 +149,7 @@ async def _attach_profile_runtime(profile: dict) -> dict:
     rt = booking_engine.get_runtime(profile["id"])
     profile["status"] = rt.status
     profile["next_schedule_at"] = _format_next_schedule_at(profile["id"])
+    profile["candidate_pool"] = booking_engine.pool_status(profile["id"])
     profile["latest_booking_result"] = await _build_recent_booking_summary(profile)
     return profile
 
@@ -421,18 +424,46 @@ async def update_profile(profile_id: int, body: ProfileUpdate, request: Request)
     if not profile:
         raise HTTPException(404, "Profile not found")
     rt = booking_engine.get_runtime(profile_id)
+    # Only fields that shape the booking timeline should trigger a reschedule.
+    # Compare old vs new values so saving unrelated prefs (venues, priorities, ...)
+    # does not re-emit the whole "[Schedule] ..." block in the log.
     schedule_changed = any(
-        key in updates
-        for key in ("schedule_enabled", "schedule_weekdays", "schedule_time")
+        key in updates and existing.get(key) != profile.get(key)
+        for key in (
+            "schedule_enabled",
+            "schedule_weekdays",
+            "schedule_time",
+            "pre_query_delay",
+            "captcha_prefetch_lead_seconds",
+        )
+    )
+    # Selection changes rebuild the candidate pool; with < 12h to T they also query now.
+    pool_changed = any(
+        key in updates and existing.get(key) != profile.get(key)
+        for key in (
+            "venue_prefs",
+            "time_prefs",
+            "dual_slot_enabled",
+            "dual_slot_prefs",
+            "target_days",
+            "booking_channel",
+        )
     )
     if profile.get("schedule_enabled"):
         if rt.status != "running":
-            await scheduler.sync_resident_schedule(profile_id, profile=profile, reason="update")
+            has_pending_job = scheduler.get_next_run_time(profile_id) is not None
+            if schedule_changed or not has_pending_job:
+                await scheduler.sync_resident_schedule(profile_id, profile=profile, reason="update")
+            elif pool_changed:
+                await scheduler.refresh_pool_for_profile(profile_id, profile=profile, reason="update")
     elif existing.get("schedule_enabled") and schedule_changed and rt.status != "running":
         scheduler.cancel_profile(profile_id)
         rt.status = "idle"
         await database.update_status(profile_id, "idle")
         log_manager.emit(profile_id, "[Schedule] Resident schedule disabled by config update", status="idle")
+    elif pool_changed and rt.status == "waiting":
+        # One-off schedule (定时启动) pending: keep its pool in sync with the selection too.
+        await scheduler.refresh_pool_for_profile(profile_id, profile=profile, reason="update")
     return await _attach_profile_runtime(await database.get_profile(profile_id))
 
 

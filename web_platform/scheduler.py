@@ -1,12 +1,12 @@
 """
 APScheduler job management: per-profile scheduled booking.
 
-Timeline (matching userscript):
-  T-60s   Login check (prepare authenticated session)
+Timeline:
+  T-12h   Candidate pool query (or immediately when scheduled with < 12h left)
+  T-150s  Login check; repeated at T-90s and T-30s, re-login when invalid
   T-6s    Prefetch 6 captchas anonymously (store for T=0)
-  T-Xms   First court query + start 1s polling (anonymous, max 20 updates)
-  T-2s    Final session validation
-  T=0     Execute booking (use stored captchas + latest court data)
+  T-Xms   Live court query + 1s polling (anonymous, max 20 updates) refines the pool
+  T=0     Execute booking straight from the candidate pool (no blocking query)
 """
 
 import asyncio
@@ -22,16 +22,20 @@ import log_manager
 
 scheduler = AsyncIOScheduler()
 
-_JOB_IDS = ["login", "captcha", "query", "precheck", "book"]
+LOGIN_CHECK_LEAD_SECONDS = [150, 90, 30]          # T-150s, then every 60s
+_LOGIN_JOB_PREFIXES = [f"login{lead}" for lead in LOGIN_CHECK_LEAD_SECONDS]
+_JOB_IDS = ["pool", *_LOGIN_JOB_PREFIXES, "captcha", "query", "book"]
 MAX_QUERY_UPDATES = 20
 QUERY_POLL_INTERVAL_SECONDS = 1.0
 QUERY_ALIGNMENT_TOLERANCE_SECONDS = 0.10
 QUERY_SLEEP_CHUNK_SECONDS = 0.05
 DEFAULT_CAPTCHA_PREFETCH_LEAD_SECONDS = 6
-FINAL_SESSION_CHECK_LEAD_SECONDS = 2
-LOGIN_LEAD_SECONDS = 60
 LOGIN_CHECK_MAX_ATTEMPTS = 2
 LOGIN_RETRY_DELAY_SECONDS = 0.5
+POOL_LEAD_SECONDS = 12 * 3600                     # T-12h candidate pool query
+POOL_IMMEDIATE_DELAY_SECONDS = 3                  # debounce for "query now" (config edits)
+POOL_RETRY_DELAY_SECONDS = 120                    # retry spacing when venues stay unresolved
+POOL_MAX_ATTEMPTS = 3
 _scheduling_lock: set[int] = set()  # Prevent concurrent schedule_profile calls
 WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -116,9 +120,7 @@ async def _do_schedule_profile(profile_id: int, target: datetime | None = None, 
     # Reset runtime state for new schedule
     rt = booking_engine.get_runtime(profile_id)
     rt.cancel_event.clear()
-    booking_engine.reset_query_snapshot(rt)
     booking_engine.clear_prefetched_captchas(rt)
-    booking_engine.mark_session_ready(rt, False, "not checked")
 
     schedule_time_str = profile.get("schedule_time", "08:40:00")
     pre_query_delay = profile.get("pre_query_delay", 1800)  # default 1.8s
@@ -128,23 +130,32 @@ async def _do_schedule_profile(profile_id: int, target: datetime | None = None, 
     now = datetime.now()
     if target is None:
         target = _get_manual_target(schedule_time_str, now=now)
+    rt.target_at = target
 
-    login_time = target - timedelta(seconds=LOGIN_LEAD_SECONDS)
+    # Candidate pool: all selected courts now, IDs filled by the T-12h query.
+    booking_date = booking_engine.target_booking_date(profile, rt)
+    pool_summary = booking_engine.rebuild_pool_for_profile(rt, profile, booking_date) or {}
+
+    pool_time = target - timedelta(seconds=POOL_LEAD_SECONDS)
+    login_times = [(lead, target - timedelta(seconds=lead)) for lead in LOGIN_CHECK_LEAD_SECONDS]
     captcha_time = target - timedelta(seconds=captcha_prefetch_lead_seconds)
     query_time = target - timedelta(milliseconds=pre_query_delay)
-    final_check_time = target - timedelta(seconds=FINAL_SESSION_CHECK_LEAD_SECONDS)
 
-    rt = booking_engine.get_runtime(profile_id)
     rt.status = "waiting"
     await database.update_status(profile_id, "waiting")
 
     log_manager.emit(profile_id,
         f"[Schedule] mode={reason} | T={target.strftime('%Y-%m-%d %H:%M:%S')} | "
-        f"login@T-{LOGIN_LEAD_SECONDS}s({login_time.strftime('%H:%M:%S')}) | "
+        f"pool@T-12h({pool_time.strftime('%m-%d %H:%M:%S')}) | "
+        f"login@T-{'/'.join(str(l) for l in LOGIN_CHECK_LEAD_SECONDS)}s | "
         f"captcha@T-{captcha_prefetch_lead_seconds}s({captcha_time.strftime('%H:%M:%S')}) | "
-        f"query@T-{pre_query_delay}ms({query_time.strftime('%H:%M:%S.%f')[:-3]}) | "
-        f"session@T-{FINAL_SESSION_CHECK_LEAD_SECONDS}s({final_check_time.strftime('%H:%M:%S')})",
+        f"query@T-{pre_query_delay}ms({query_time.strftime('%H:%M:%S.%f')[:-3]})",
         status="waiting")
+    log_manager.emit(
+        profile_id,
+        f"[Pool] {booking_date}: {pool_summary.get('selected', 0)} selected courts in pool, "
+        f"{pool_summary.get('bookable', 0)} already bookable, {pool_summary.get('unresolved', 0)} awaiting IDs",
+    )
 
     def _add_job(func, run_date, job_id, label, args=None):
         if args is None:
@@ -159,7 +170,18 @@ async def _do_schedule_profile(profile_id: int, target: datetime | None = None, 
                               misfire_grace_time=60)
             log_manager.emit(profile_id, f"  Job [{label}] running immediately (past {run_date.strftime('%H:%M:%S')})")
 
-    _add_job(_run_login_check,      login_time,   f"login_{profile_id}",   "login")
+    if pool_time > now:
+        _schedule_pool_job(profile_id, pool_time, "T-12h")
+        log_manager.emit(profile_id, f"  Job [pool] scheduled at {pool_time.strftime('%m-%d %H:%M:%S')}")
+    else:
+        run_at = _schedule_pool_job(profile_id, now + timedelta(seconds=POOL_IMMEDIATE_DELAY_SECONDS), reason)
+        log_manager.emit(
+            profile_id,
+            f"  Job [pool] less than 12h to T, querying now (at {run_at.strftime('%H:%M:%S')})",
+        )
+    for lead, login_time in login_times:
+        _add_job(_run_login_check, login_time, f"login{lead}_{profile_id}", f"login T-{lead}s",
+                 [profile_id, f"T-{lead}s"])
     _add_job(_run_captcha_prefetch, captcha_time,  f"captcha_{profile_id}", "captcha")
     _add_job(
         _run_continuous_query,
@@ -168,9 +190,45 @@ async def _do_schedule_profile(profile_id: int, target: datetime | None = None, 
         "query",
         [profile_id, query_time.timestamp()],
     )
-    _add_job(_run_final_session_check, final_check_time, f"precheck_{profile_id}", "session")
     _add_job(_run_booking,          target,        f"book_{profile_id}",    "booking")
     return target
+
+
+def _schedule_pool_job(profile_id: int, run_at: datetime, source: str, attempt: int = 1) -> datetime:
+    """(Re)schedule the single pool-refresh job for a profile. Later calls replace earlier ones."""
+    scheduler.add_job(
+        _run_pool_refresh,
+        trigger=DateTrigger(run_date=run_at),
+        id=f"pool_{profile_id}",
+        args=[profile_id, source, attempt],
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    return run_at
+
+
+async def refresh_pool_for_profile(profile_id: int, profile: dict | None = None, reason: str = "update"):
+    """Selection changed while a schedule is pending: rebuild the pool, query now if < 12h to T."""
+    if profile is None:
+        profile = await database.get_profile(profile_id)
+    if not profile:
+        return None
+    rt = booking_engine.get_runtime(profile_id)
+    if rt.target_at is None or rt.status == "running":
+        return None
+
+    booking_date = booking_engine.target_booking_date(profile, rt)
+    summary = booking_engine.rebuild_pool_for_profile(rt, profile, booking_date) or {}
+    log_manager.emit(
+        profile_id,
+        f"[Pool] Selection updated: {summary.get('selected', 0)} selected, "
+        f"{summary.get('bookable', 0)} bookable, {summary.get('unresolved', 0)} awaiting IDs ({booking_date})",
+    )
+    now = datetime.now()
+    if (rt.target_at - now).total_seconds() < POOL_LEAD_SECONDS:
+        run_at = _schedule_pool_job(profile_id, now + timedelta(seconds=POOL_IMMEDIATE_DELAY_SECONDS), reason)
+        log_manager.emit(profile_id, f"[Pool] Less than 12h to T, querying at {run_at.strftime('%H:%M:%S')}")
+    return summary
 
 
 def stop_query_polling(rt) -> None:
@@ -192,6 +250,7 @@ def cancel_profile(profile_id: int, cancel_runtime: bool = True, cancel_booking_
     stop_query_polling(rt)
     if cancel_runtime:
         rt.cancel_event.set()
+        rt.target_at = None
     if cancel_booking_task and rt.task and not rt.task.done():
         rt.task.cancel()
 
@@ -257,9 +316,44 @@ async def restore_enabled_profiles():
             await sync_resident_schedule(profile["id"], profile=profile, reason="startup")
 
 
-# ==================== T-60s: Login Check ====================
+# ==================== T-12h: Candidate Pool Query ====================
 
-async def _run_login_check(profile_id: int):
+async def _run_pool_refresh(profile_id: int, source: str = "T-12h", attempt: int = 1):
+    profile = await database.get_profile(profile_id)
+    if not profile:
+        return
+    rt = booking_engine.get_runtime(profile_id)
+    if rt.cancel_event.is_set() or rt.target_at is None:
+        return
+
+    booking_date = booking_engine.target_booking_date(profile, rt)
+    log_manager.emit(
+        profile_id,
+        f"[Pool] Querying {booking_date} inventory ({source}, attempt {attempt}/{POOL_MAX_ATTEMPTS})...",
+    )
+    try:
+        await asyncio.to_thread(
+            booking_engine.do_query_candidates, profile_id, profile, None, None, source, booking_date
+        )
+    except Exception as e:
+        log_manager.emit(profile_id, f"[Pool] Query error: {e}")
+
+    summary = booking_engine.pool_status(profile_id) or {}
+    unresolved = summary.get("unresolved", 0)
+    if unresolved and attempt < POOL_MAX_ATTEMPTS and rt.target_at is not None:
+        now = datetime.now()
+        run_at = now + timedelta(seconds=POOL_RETRY_DELAY_SECONDS)
+        if run_at < rt.target_at - timedelta(seconds=LOGIN_CHECK_LEAD_SECONDS[0]):
+            _schedule_pool_job(profile_id, run_at, source, attempt + 1)
+            log_manager.emit(
+                profile_id,
+                f"[Pool] {unresolved} courts still without IDs, retrying at {run_at.strftime('%H:%M:%S')}",
+            )
+
+
+# ==================== T-150s / T-90s / T-30s: Login Check ====================
+
+async def _run_login_check(profile_id: int, label: str = "T-150s"):
     profile = await database.get_profile(profile_id)
     if not profile:
         return
@@ -267,41 +361,50 @@ async def _run_login_check(profile_id: int):
     if rt.cancel_event.is_set():
         return
 
-    log_manager.emit(profile_id, f"[T-{LOGIN_LEAD_SECONDS}s] Checking login status...")
-
     def _check():
-        if rt.client:
-            log_manager.emit(profile_id, f"[T-{LOGIN_LEAD_SECONDS}s] Session exists, verifying with /web/order/seachMyOrder.html...")
-            try:
-                valid, reason = booking_engine.verify_booking_session(rt.client)
-                if valid:
-                    log_manager.emit(profile_id, f"[T-{LOGIN_LEAD_SECONDS}s] Session valid ({reason})")
-                    return
-                else:
-                    log_manager.emit(profile_id, f"[T-{LOGIN_LEAD_SECONDS}s] Session invalid ({reason}), re-login...")
-            except Exception as e:
-                log_manager.emit(profile_id, f"[T-{LOGIN_LEAD_SECONDS}s] Session check failed: {e}, re-login...")
+        if not rt.login_lock.acquire(blocking=False):
+            log_manager.emit(profile_id, f"[{label}] Login check already running, skipped")
+            return
+        try:
+            log_manager.emit(profile_id, f"[{label}] Checking login status...")
+            if rt.client:
+                try:
+                    valid, reason = booking_engine.verify_booking_session(rt.client)
+                    booking_engine.mark_session_ready(rt, valid, reason)
+                    if valid:
+                        log_manager.emit(profile_id, f"[{label}] Session valid ({reason})")
+                        return
+                    log_manager.emit(profile_id, f"[{label}] Session invalid ({reason}), re-login...")
+                except Exception as e:
+                    booking_engine.mark_session_ready(rt, False, f"check failed: {e}")
+                    log_manager.emit(profile_id, f"[{label}] Session check failed: {e}, re-login...")
+            else:
+                log_manager.emit(profile_id, f"[{label}] No session yet, logging in...")
 
-        for attempt in range(1, LOGIN_CHECK_MAX_ATTEMPTS + 1):
-            if booking_engine.do_login(profile_id, profile["username"], profile["password"], profile.get("booking_channel")):
-                if attempt > 1:
+            for attempt in range(1, LOGIN_CHECK_MAX_ATTEMPTS + 1):
+                if rt.cancel_event.is_set():
+                    return
+                if booking_engine.do_login(profile_id, profile["username"], profile["password"], profile.get("booking_channel")):
+                    if attempt > 1:
+                        log_manager.emit(
+                            profile_id,
+                            f"[{label}] Login recovered on retry {attempt}/{LOGIN_CHECK_MAX_ATTEMPTS}"
+                        )
+                    return
+
+                if attempt < LOGIN_CHECK_MAX_ATTEMPTS:
                     log_manager.emit(
                         profile_id,
-                        f"[T-{LOGIN_LEAD_SECONDS}s] Login recovered on retry {attempt}/{LOGIN_CHECK_MAX_ATTEMPTS}"
+                        f"[{label}] Login attempt {attempt}/{LOGIN_CHECK_MAX_ATTEMPTS} failed, retrying..."
                     )
-                return
+                    time.sleep(LOGIN_RETRY_DELAY_SECONDS)
 
-            if attempt < LOGIN_CHECK_MAX_ATTEMPTS:
-                log_manager.emit(
-                    profile_id,
-                    f"[T-{LOGIN_LEAD_SECONDS}s] Login attempt {attempt}/{LOGIN_CHECK_MAX_ATTEMPTS} failed, retrying..."
-                )
-                time.sleep(LOGIN_RETRY_DELAY_SECONDS)
-
-        log_manager.emit(
-            profile_id,
-            f"[T-{LOGIN_LEAD_SECONDS}s] Login failed after {LOGIN_CHECK_MAX_ATTEMPTS} attempts"
-        )
+            log_manager.emit(
+                profile_id,
+                f"[{label}] Login failed after {LOGIN_CHECK_MAX_ATTEMPTS} attempts"
+            )
+        finally:
+            rt.login_lock.release()
 
     await asyncio.to_thread(_check)
 
@@ -344,7 +447,7 @@ async def _run_continuous_query(profile_id: int, query_anchor_ts: float | None =
     async def _query_once(seq: int, started_at: float, attempt_no: int):
         try:
             await asyncio.to_thread(
-                booking_engine.do_query_candidates, profile_id, profile, seq, started_at
+                booking_engine.do_query_candidates, profile_id, profile, seq, started_at, "live"
             )
         except Exception as e:
             log_manager.emit(profile_id, f"[Query #{attempt_no}] Error: {e}")
@@ -389,36 +492,6 @@ async def _run_continuous_query(profile_id: int, query_anchor_ts: float | None =
     rt.query_task = asyncio.create_task(_poll())
 
 
-# ==================== T-2s: Final Session Check ====================
-
-async def _run_final_session_check(profile_id: int):
-    rt = booking_engine.get_runtime(profile_id)
-    if rt.cancel_event.is_set():
-        return
-
-    def _check():
-        if not rt.client:
-            booking_engine.mark_session_ready(rt, False, "no client")
-            log_manager.emit(profile_id, "[T-2s] No session available for final validation")
-            return
-
-        valid, reason = booking_engine.verify_booking_session(rt.client)
-        booking_engine.mark_session_ready(rt, valid, reason)
-
-        if valid:
-            log_manager.emit(profile_id, f"[T-2s] Session ready ({reason})")
-            return
-
-        try:
-            rt.client.close()
-        except Exception:
-            pass
-        rt.client = None
-        log_manager.emit(profile_id, f"[T-2s] Session invalid ({reason})")
-
-    await asyncio.to_thread(_check)
-
-
 # ==================== T=0: Execute Booking ====================
 
 async def _run_booking(profile_id: int):
@@ -435,9 +508,9 @@ async def _run_booking(profile_id: int):
         status="running")
 
     await database.update_status(profile_id, "running")
-    result = await asyncio.to_thread(booking_engine.run_booking_flow, profile_id, profile)
+    result = await asyncio.to_thread(booking_engine.run_booking_flow, profile_id, profile, True)
 
-    # Stop spawning new ticks; in-flight queries may still update the snapshot.
+    # Stop spawning new ticks; in-flight queries may still update the pool.
     stop_query_polling(rt)
 
     if result and result.get("persist_latest_result"):

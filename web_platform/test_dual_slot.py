@@ -200,40 +200,5 @@ class OrderParamTests(unittest.TestCase):
         self.assertEqual(param["stockdetailids"], "seatA,seatB")
 
 
-class QuerySnapshotTests(unittest.TestCase):
-    def test_later_started_query_wins_if_earlier_finishes_last(self):
-        from booking_engine import ProfileRuntime, apply_query_candidates
-
-        rt = ProfileRuntime(profile_id=1)
-        self.assertTrue(apply_query_candidates(rt, 1, {"a": [{"id": 1}]}, started_at=1.0))
-        self.assertTrue(apply_query_candidates(rt, 2, {"b": [{"id": 2}]}, started_at=2.0))
-        self.assertEqual(list(rt.cached_candidates), ["b"])
-        self.assertFalse(apply_query_candidates(rt, 1, {"a": [{"id": 9}]}, started_at=1.0))
-        self.assertEqual(list(rt.cached_candidates), ["b"])
-
-    def test_earlier_query_still_applies_if_newer_has_not_landed(self):
-        from booking_engine import ProfileRuntime, apply_query_candidates
-
-        rt = ProfileRuntime(profile_id=1)
-        self.assertTrue(apply_query_candidates(rt, 1, {"a": [{"id": 1}]}, started_at=1.0))
-        self.assertEqual(list(rt.cached_candidates), ["a"])
-        self.assertTrue(apply_query_candidates(rt, 2, {"b": [{"id": 2}]}, started_at=2.0))
-        self.assertEqual(list(rt.cached_candidates), ["b"])
-
-    def test_reset_rejects_queries_started_before_cutoff(self):
-        from booking_engine import ProfileRuntime, apply_query_candidates, reset_query_snapshot
-
-        rt = ProfileRuntime(profile_id=1)
-        self.assertTrue(apply_query_candidates(rt, 4, {"old": [{"id": 1}]}, started_at=10.0))
-        reset_query_snapshot(rt)
-        self.assertEqual(rt.cached_candidates, {})
-        self.assertFalse(apply_query_candidates(rt, 4, {"old": [{"id": 9}]}, started_at=10.0))
-        self.assertEqual(rt.cached_candidates, {})
-        self.assertTrue(apply_query_candidates(rt, 1, {"new": [{"id": 2}]}, started_at=rt.query_cutoff_at + 0.001))
-        self.assertEqual(list(rt.cached_candidates), ["new"])
-        self.assertFalse(apply_query_candidates(rt, 20, {"old": [{"id": 3}]}, started_at=10.0))
-        self.assertEqual(list(rt.cached_candidates), ["new"])
-
-
 if __name__ == "__main__":
     unittest.main()
