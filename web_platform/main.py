@@ -67,6 +67,7 @@ def require_admin(user: dict):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await database.init_db()
+    await asyncio.to_thread(booking_engine.warm_query_clients)
     scheduler.start()
     await scheduler.restore_enabled_profiles()
     relay_task = asyncio.create_task(log_manager.relay_loop())
@@ -77,6 +78,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     scheduler.stop()
+    await asyncio.to_thread(booking_engine.close_query_clients)
     await asyncio.to_thread(close_capture)
 
 
@@ -835,9 +837,10 @@ async def query_venues(venue_id: int, date: str, channel: str = "8080"):
 async def ws_logs(websocket: WebSocket, profile_id: int):
     await websocket.accept()
     plog = log_manager.get_profile_log(profile_id)
+    history = list(plog.buffer)
     plog.ws_clients.add(websocket)
     try:
-        for entry in plog.buffer:
+        for entry in history:
             await websocket.send_json(entry)
         while True:
             await websocket.receive_text()

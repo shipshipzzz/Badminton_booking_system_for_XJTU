@@ -3,3 +3,4 @@ __pycache__/
 
 web_platform/bookings.db
 web_platform/logs/
+/tests/

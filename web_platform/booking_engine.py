@@ -35,17 +35,15 @@ from booking_api import (  # noqa: E402
     query_seats,
     fetch_captcha,
     fetch_ok_area,
-    submit_order,
     submit_booking,
     generate_yzm_data,
-    _times_from_ok_area,
-    seats_from_ok_area,
 )
 
 import httpx  # noqa: E402
 import log_manager  # noqa: E402
 from site_config import get_channel, normalize_channel  # noqa: E402
 from http_capture import capture_context, submit_with_capture_context
+from inventory_query import InventoryService
 from dual_slot import (  # noqa: E402
     collect_priority_levels,
     collect_query_slot_times,
@@ -576,131 +574,20 @@ def do_prefetch_captchas(profile_id: int, count: int = 6) -> list:
 
 # ==================== Step 3: Query Courts (Anonymous, T-Xms) ====================
 
-def _alternate_channel(channel: str) -> str:
-    return "80" if normalize_channel(channel) == "8080" else "8080"
+_inventory_service = InventoryService()
+
+
+def warm_query_clients():
+    _inventory_service.warm()
+
+
+def close_query_clients():
+    _inventory_service.close()
 
 
 def _fetch_venue_inventory(venue_prefs: list[dict], slot_times: list[str], date: str,
-                           channel: str, log) -> tuple[dict[int, dict], dict]:
-    """Fetch inventory on the profile's channel, then retry failed venues on the other one.
-
-    Stock/seat IDs are identical on both channels, and the :8080 H5 channel rejects
-    anonymous queries outside 08:40-21:40 while the :80 portal answers all day.
-    """
-    results, timing = _fetch_venue_inventory_on(venue_prefs, slot_times, date, channel, log)
-    failed = [vp for vp in venue_prefs if not results.get(vp["id"], {}).get("ok")]
-    if not failed:
-        return results, timing
-
-    alt = _alternate_channel(channel)
-    alt_results, alt_timing = _fetch_venue_inventory_on(failed, slot_times, date, alt, log)
-    recovered = []
-    for vp in failed:
-        if alt_results.get(vp["id"], {}).get("ok"):
-            results[vp["id"]] = alt_results[vp["id"]]
-            recovered.append(vp["name"])
-    timing["ok"] = sum(1 for r in results.values() if r.get("ok"))
-    timing["failed"] = len(results) - timing["ok"]
-    for key in ("times_ms", "seats_ms", "total_ms"):
-        timing[key] += alt_timing[key]
-    timing["fallback"] = f"{len(recovered)}/{len(failed)} via {alt}"
-    log(
-        f"[Query] {', '.join(vp['name'] for vp in failed)} failed on {channel}, "
-        f"retried on {alt}: recovered {', '.join(recovered) or 'none'}"
-    )
-    return results, timing
-
-
-def _fetch_venue_inventory_on(venue_prefs: list[dict], slot_times: list[str], date: str,
-                              channel: str, log) -> tuple[dict[int, dict], dict]:
-    """Fetch times + seats for every venue on one channel with anonymous clients.
-
-    Returns ({venue_id: {"ok", "times", "seats_by_stock"}}, timing). A venue whose
-    times fetch failed is reported ok=False; a slot whose seat fetch failed is
-    reported as seats_by_stock[stock_id] = None so the pool keeps its last state.
-    """
-    seat_mode = get_channel(channel).seat_mode
-    results: dict[int, dict] = {}
-    timing = {"ok": 0, "failed": 0}
-    total_started = time.perf_counter()
-
-    stage1_started = time.perf_counter()
-    venue_rows_map: dict[int, list] = {}
-    venue_workers = min(QUERY_MAX_WORKERS, max(1, len(venue_prefs)))
-    with ThreadPoolExecutor(max_workers=venue_workers) as executor:
-        if seat_mode == "ok_area":
-            future_to_venue = {
-                submit_with_capture_context(executor, query_ok_area_anonymous, vp["id"], date, channel): vp
-                for vp in venue_prefs
-            }
-            for future in future_to_venue:
-                vp = future_to_venue[future]
-                try:
-                    rows = future.result()
-                except Exception as e:
-                    rows = None
-                    log(f"[Query] {vp['name']} times failed: {e}")
-                if rows is None:
-                    timing["failed"] += 1
-                    results[vp["id"]] = {"ok": False}
-                    continue
-                timing["ok"] += 1
-                venue_rows_map[vp["id"]] = rows
-                results[vp["id"]] = {"ok": True, "times": _times_from_ok_area(rows), "seats_by_stock": {}}
-        else:
-            future_to_venue = {
-                submit_with_capture_context(executor, query_times_anonymous, vp["id"], date, channel): vp
-                for vp in venue_prefs
-            }
-            for future in future_to_venue:
-                vp = future_to_venue[future]
-                try:
-                    times = future.result()
-                    timing["ok"] += 1
-                    results[vp["id"]] = {"ok": True, "times": times, "seats_by_stock": {}}
-                except Exception as e:
-                    timing["failed"] += 1
-                    results[vp["id"]] = {"ok": False}
-                    log(f"[Query] {vp['name']} times failed: {e}")
-
-    seat_jobs = []
-    for vp in venue_prefs:
-        result = results.get(vp["id"])
-        if not result or not result["ok"]:
-            continue
-        for time_str in slot_times:
-            slot = _find_matching_slot(result["times"], time_str)
-            if slot:
-                seat_jobs.append((vp, slot))
-
-    stage2_started = time.perf_counter()
-    if seat_jobs:
-        if seat_mode == "ok_area":
-            for vp, slot in seat_jobs:
-                results[vp["id"]]["seats_by_stock"][str(slot["ID"])] = seats_from_ok_area(
-                    venue_rows_map.get(vp["id"], []), slot["ID"]
-                )
-        else:
-            seat_workers = min(QUERY_MAX_WORKERS, len(seat_jobs))
-            with ThreadPoolExecutor(max_workers=seat_workers) as executor:
-                future_to_job = {
-                    submit_with_capture_context(executor, query_seats_anonymous, vp["id"], slot["ID"], date, channel): (vp, slot)
-                    for vp, slot in seat_jobs
-                }
-                for future in future_to_job:
-                    vp, slot = future_to_job[future]
-                    try:
-                        seats = future.result()
-                    except Exception as e:
-                        log(f"[Query] {vp['name']} seats failed: {e}")
-                        seats = None
-                    results[vp["id"]]["seats_by_stock"][str(slot["ID"])] = seats
-
-    finished = time.perf_counter()
-    timing["times_ms"] = (stage2_started - stage1_started) * 1000
-    timing["seats_ms"] = (finished - stage2_started) * 1000
-    timing["total_ms"] = (finished - total_started) * 1000
-    return results, timing
+                           channel: str, log, on_venue=None) -> tuple[dict[int, dict], dict]:
+    return _inventory_service.fetch(venue_prefs, slot_times, date, log, on_venue=on_venue)
 
 
 def do_query_candidates(profile_id: int, profile: dict, seq: int | None = None,
@@ -732,8 +619,29 @@ def do_query_candidates(profile_id: int, profile: dict, seq: int | None = None,
         log(f"{tag}: nothing selected (venues={len(venue_prefs)}, slots={len(slot_times)})")
         return {}
 
+    stats = {"applied": [], "failed": [], "stale": [], "resolved": 0,
+             "removed": [], "restored": [], "added": []}
+    names = {vp["id"]: vp["name"] for vp in venue_prefs}
+
+    def apply_venue(venue_id, result):
+        with rt.candidates_lock:
+            if rt.pool is None or rt.pool.date != date:
+                return
+            update = merge_venue_results(rt.pool, {venue_id: result}, started_at, seq=seq,
+                                         source=source, venue_prefs=venue_prefs)
+            for key, value in update.items():
+                if isinstance(value, list):
+                    stats[key].extend(value)
+                else:
+                    stats[key] += value
+        disposition = "applied" if update["applied"] else "stale-discarded"
+        log(f"{tag}: {names[venue_id]} winner={result['channel']} {disposition} "
+            f"({result['winner_ms']:.0f}ms)")
+
     with capture_context(profile_id=profile_id, query_seq=seq, source=source, booking_date=date):
-        venue_results, timing = _fetch_venue_inventory(venue_prefs, slot_times, date, channel, log)
+        venue_results, timing = _fetch_venue_inventory(venue_prefs, slot_times, date, channel, log,
+                                                       on_venue=apply_venue)
+    stats["failed"] = [venue_id for venue_id, result in venue_results.items() if not result.get("ok")]
     timing_text = (
         f"times:{timing['times_ms']:.0f}ms seats:{timing['seats_ms']:.0f}ms total:{timing['total_ms']:.0f}ms"
     )
@@ -749,18 +657,15 @@ def do_query_candidates(profile_id: int, profile: dict, seq: int | None = None,
                 f"({summary_before['bookable']} bookable, last ok {summary_before['last_success_at'] or 'never'})"
             )
             return {"applied": [], "failed": list(venue_results)}
-        stats = merge_venue_results(rt.pool, venue_results, started_at, seq=seq, source=source,
-                                    venue_prefs=venue_prefs)
         summary = pool_summary(rt.pool)
         signature = bookable_signature(rt.pool)
         composition_changed = signature != rt.pool_log_signature
         rt.pool_log_signature = signature
         slot_lines = describe_slots(rt.pool)
 
-    names = {vp["id"]: vp["name"] for vp in venue_prefs}
     parts = [f"venues ok={timing['ok']} failed={timing['failed']}"]
-    if timing.get("fallback"):
-        parts.append(f"fallback {timing['fallback']}")
+    parts.append("winners: " + ", ".join(f"{names[venue_id]}={winner}"
+                                       for venue_id, winner in timing["winners"].items()))
     if stats["stale"]:
         parts.append("stale-discarded: " + ", ".join(names.get(v, str(v)) for v in stats["stale"]))
     log(f"{tag}: {' | '.join(parts)} ({timing_text})")
@@ -795,7 +700,7 @@ def do_book_court(profile_id: int, court: dict, shared: dict | None = None) -> d
 
 def do_book_courts(profile_id: int, courts: list[dict], shared: dict | None = None) -> dict:
     """
-    Book 1-2 courts in one order. One captcha, one show.html, one book.html.
+    Book 1-2 courts with one captcha and a direct channel-specific submit.
     Only retries on captcha / retryable errors.
     """
     log = lambda msg: log_manager.emit(profile_id, msg)
@@ -848,8 +753,6 @@ def do_book_courts(profile_id: int, courts: list[dict], shared: dict | None = No
                             return {"success": False, "message": "Quota reached"}
                 if rt.cancel_event.is_set():
                     return {"success": False, "message": "Cancelled"}
-                log(f"{tag} -> order...")
-                submit_order(client, venue_id, channel=rt.channel, items=items)
                 log(f"{tag} -> submit...")
                 result = submit_booking(client, venue_id, yzm_data=yzm_data, channel=rt.channel, items=items)
 

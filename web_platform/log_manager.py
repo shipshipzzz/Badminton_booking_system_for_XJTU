@@ -4,6 +4,7 @@ import asyncio
 import os
 import queue
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -53,7 +54,7 @@ def emit(profile_id: int, msg: str, status: str = None):
     now = time.time()
     ts = time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now * 1000) % 1000:03d}"
     # "t" is the epoch time; the UI uses it to hide entries older than a client-side clear point.
-    entry = {"ts": ts, "t": round(now, 6), "msg": msg}
+    entry = {"id": uuid.uuid4().hex, "ts": ts, "t": round(now, 6), "msg": msg}
     if status:
         entry["status"] = status
     _log_queue.put((profile_id, entry))

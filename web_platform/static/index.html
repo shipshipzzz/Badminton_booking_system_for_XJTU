@@ -362,7 +362,7 @@ input:focus, select:focus { border-color:#1e88e5; }
               <div class="chip" :class="{on: current.booking_channel==='80'}" @click="setBookingChannel('80')">电脑80</div>
             </div>
             <div style="font-size:12px;color:#666;margin-top:4px">
-              登录、查场、滑块、下单整条链路走所选通道。切换后需重新「测试登录」。同一账号开两个 profile 各走一条，只能对冲其中一条宕机，不会多抢一份库存。
+              登录、滑块、下单走所选通道；候选池查场同时走 8080 和 80，按场馆采用先返回的有效结果。切换后需重新「测试登录」。同一账号开两个 profile 各走一条，不会增加可预约额度。
             </div>
             <div style="font-size:12px;color:#666;margin-top:4px">
               开启后会自动排到下一个勾选的星期，无需每天手动点启用。
@@ -910,7 +910,7 @@ createApp({
     function doLogout() {
       stopStatusPoll()
       disconnectWs()
-      if (wsStatus) { try { wsStatus.close() } catch {} wsStatus = null }
+      disconnectStatusWs()
       const token = authToken.value
       authToken.value = ''
       authUser.value = ''
@@ -1040,6 +1040,7 @@ createApp({
       syncCountdownFromProfile(current.value)
     }
     async function selectProfile(id) {
+      disconnectWs()
       stopCountdown()
       courtData.value = null
       currentId.value = id
@@ -1053,6 +1054,7 @@ createApp({
       newPassword.value = ''
       changePwResult.value = null
       const data = await apiJson(`/api/profiles/${id}`)
+      if (currentId.value !== id || view.value !== 'profile' || !authToken.value) return
       if (data) {
         current.value = normalizeProfileData(data)
         syncCountdownFromProfile(current.value)
@@ -1511,6 +1513,8 @@ createApp({
 
     // ---- WebSocket ----
     let wsProfileId = null
+    let wsReconnectTimer = null
+    let wsStatusReconnectTimer = null
     // Client-side clear point per profile: the server keeps its buffer and log files,
     // the browser just stops showing entries at or before the point where "清空" was clicked.
     const LOG_CLEAR_STORAGE_KEY = 'log_clear_marks'
@@ -1529,35 +1533,67 @@ createApp({
     }
     function connectWs(profileId) {
       disconnectWs()
+      if (!authToken.value || currentId.value !== profileId || view.value !== 'profile') return
       wsProfileId = profileId
       wsClearMark = logClearMark(profileId)
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      ws = new WebSocket(`${proto}//${location.host}/ws/logs/${profileId}`)
-      ws.onmessage = (e) => {
+      const socket = new WebSocket(`${proto}//${location.host}/ws/logs/${profileId}`)
+      ws = socket
+      socket.onmessage = (e) => {
+        if (ws !== socket || currentId.value !== profileId || wsProfileId !== profileId) return
         const entry = JSON.parse(e.data)
         if (Number(entry.t) > 0 && Number(entry.t) <= wsClearMark) return
+        if (logs.value.some(existing => entry.id
+          ? existing.id === entry.id
+          : existing.t === entry.t && existing.ts === entry.ts
+            && existing.msg === entry.msg && existing.status === entry.status)) return
         logs.value.push(entry)
         if (logs.value.length > 500) logs.value.splice(0, logs.value.length - 500)
         nextTick(() => {
           if (logConsole.value) logConsole.value.scrollTop = logConsole.value.scrollHeight
         })
       }
-      ws.onclose = () => {
+      socket.onclose = () => {
+        if (ws !== socket) return
         ws = null
-        if (currentId.value === profileId && view.value === 'profile') {
-          setTimeout(() => connectWs(profileId), 2000)
+        if (authToken.value && currentId.value === profileId && view.value === 'profile') {
+          wsReconnectTimer = setTimeout(() => {
+            wsReconnectTimer = null
+            connectWs(profileId)
+          }, 2000)
         }
       }
-      ws.onerror = () => {}
+      socket.onerror = () => {}
     }
     function disconnectWs() {
+      if (wsReconnectTimer !== null) clearTimeout(wsReconnectTimer)
+      wsReconnectTimer = null
       wsProfileId = null
-      if (ws) { try { ws.close() } catch {} ws = null }
+      const socket = ws
+      ws = null
+      if (socket) {
+        socket.onmessage = socket.onclose = socket.onerror = null
+        try { socket.close() } catch {}
+      }
+    }
+    function disconnectStatusWs() {
+      if (wsStatusReconnectTimer !== null) clearTimeout(wsStatusReconnectTimer)
+      wsStatusReconnectTimer = null
+      const socket = wsStatus
+      wsStatus = null
+      if (socket) {
+        socket.onmessage = socket.onclose = socket.onerror = null
+        try { socket.close() } catch {}
+      }
     }
     function connectStatusWs() {
+      disconnectStatusWs()
+      if (!authToken.value) return
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      wsStatus = new WebSocket(`${proto}//${location.host}/ws/status`)
-      wsStatus.onmessage = (e) => {
+      const socket = new WebSocket(`${proto}//${location.host}/ws/status`)
+      wsStatus = socket
+      socket.onmessage = (e) => {
+        if (wsStatus !== socket || !authToken.value) return
         const d = JSON.parse(e.data)
         if (d.profile_id) {
           lastLogs[d.profile_id] = `[${d.ts}] ${d.msg}`
@@ -1565,7 +1601,17 @@ createApp({
           if (p && d.status) p.status = d.status
         }
       }
-      wsStatus.onclose = () => { setTimeout(connectStatusWs, 2000) }
+      socket.onclose = () => {
+        if (wsStatus !== socket) return
+        wsStatus = null
+        if (authToken.value) {
+          wsStatusReconnectTimer = setTimeout(() => {
+            wsStatusReconnectTimer = null
+            connectStatusWs()
+          }, 2000)
+        }
+      }
+      socket.onerror = () => {}
     }
 
     // ---- Countdown ----
@@ -1654,7 +1700,7 @@ createApp({
     })
     onUnmounted(() => {
       disconnectWs()
-      if (wsStatus) wsStatus.close()
+      disconnectStatusWs()
       stopStatusPoll()
       stopCountdown()
     })
